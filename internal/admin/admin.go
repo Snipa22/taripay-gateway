@@ -257,6 +257,24 @@ type dashboardData struct {
 	FlashIsError bool
 }
 
+// logAndCorrelate logs the full detail of a server-side failure (context describes
+// where it happened, err is the real error — e.g. a wallet gRPC dial address)
+// alongside a freshly generated correlation ID, and returns that ID. Callers embed
+// the returned ID in a generic, detail-free message rendered on the admin page —
+// task brief part 3 (I4 security-boundaries persona): internal error text (a
+// wallet gRPC dial address, in this package's case) must not be rendered in HTML
+// verbatim, but an operator debugging a report still needs a way to find the
+// matching full-detail log line. Same pattern, independently duplicated rather
+// than shared, as cmd/gateway/main.go's identical helper of the same name — this
+// package and that one don't currently share a common internal dependency this
+// would be worth factoring into, and both are small enough that the duplication
+// costs less than introducing one.
+func logAndCorrelate(context string, err error) string {
+	id := uuid.New().String()
+	log.Printf("admin: %s: [correlation_id=%s] %v", context, id, err)
+	return id
+}
+
 // handleDashboard serves GET /admin: wallet identity + balance, recent invoices (last
 // DashboardInvoiceLimit, any status), recent webhook deliveries (last
 // DashboardDeliveryLimit) with a retry button per failed row.
@@ -268,13 +286,18 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	identity, err := s.identify()
 	if err != nil {
-		log.Printf("admin: dashboard: identify: %v", err)
-		data.WalletError = "unable to reach wallet (identify failed): " + err.Error()
+		// Generic message + correlation id (task brief part 3, I4 security-
+		// boundaries persona): the real error here can contain the wallet
+		// gRPC dial address, which must not be rendered on this admin page
+		// verbatim — the full detail is still logged server-side via
+		// logAndCorrelate above.
+		cid := logAndCorrelate("dashboard: identify", err)
+		data.WalletError = fmt.Sprintf("unable to reach wallet (identify failed) — see server logs (correlation_id: %s)", cid)
 	} else {
 		balance, err := s.getBalances()
 		if err != nil {
-			log.Printf("admin: dashboard: get balances: %v", err)
-			data.WalletError = "unable to reach wallet (get balances failed): " + err.Error()
+			cid := logAndCorrelate("dashboard: get balances", err)
+			data.WalletError = fmt.Sprintf("unable to reach wallet (get balances failed) — see server logs (correlation_id: %s)", cid)
 		} else {
 			data.Identity = identityView{PublicAddress: identity.GetPublicAddress()}
 			data.Balance = balanceView{
