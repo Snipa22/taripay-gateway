@@ -453,3 +453,44 @@ func TestRunTTLSweepLoop_StopsOnContextCancellation(t *testing.T) {
 		t.Fatal("runTTLSweepLoop did not return within 2s of context cancellation")
 	}
 }
+
+// ---- checkWebhookConfig tests (S3 fail-open-HMAC-secret fix, task brief part 3)
+// ----
+
+// TestCheckWebhookConfig_CallbackURLSetSecretUnsetIsFatal confirms the exact
+// combination the review flagged (S3): a webhook callback URL configured WITHOUT an
+// HMAC secret must cause a fatal startup error (checkWebhookConfig returns a
+// non-nil error, which main() turns into log.Fatalf) — sending webhooks signed with
+// an empty, anyone-computable key is worse than sending no signature at all.
+func TestCheckWebhookConfig_CallbackURLSetSecretUnsetIsFatal(t *testing.T) {
+	err := checkWebhookConfig("https://merchant.example/webhook", "")
+	if err == nil {
+		t.Fatal("checkWebhookConfig(callbackURL set, secret unset) error = nil, want a non-nil fatal-startup error")
+	}
+}
+
+// TestCheckWebhookConfig_BothUnsetIsNotFatal confirms the unchanged "warn and skip"
+// precedent: both fields unset must NOT be fatal — invoice creation/lookup must keep
+// working standalone with webhook delivery simply disabled.
+func TestCheckWebhookConfig_BothUnsetIsNotFatal(t *testing.T) {
+	if err := checkWebhookConfig("", ""); err != nil {
+		t.Errorf("checkWebhookConfig(both unset) error = %v, want nil", err)
+	}
+}
+
+// TestCheckWebhookConfig_OnlyCallbackURLUnsetIsNotFatal confirms the other
+// unchanged "warn and skip" precedent: only the callback URL unset (secret set) must
+// NOT be fatal — a secret with no callback URL to sign anything for is harmless.
+func TestCheckWebhookConfig_OnlyCallbackURLUnsetIsNotFatal(t *testing.T) {
+	if err := checkWebhookConfig("", "some-secret"); err != nil {
+		t.Errorf("checkWebhookConfig(callback URL unset, secret set) error = %v, want nil", err)
+	}
+}
+
+// TestCheckWebhookConfig_BothSetIsNotFatal confirms normal operation (both
+// configured) is unaffected by this fix.
+func TestCheckWebhookConfig_BothSetIsNotFatal(t *testing.T) {
+	if err := checkWebhookConfig("https://merchant.example/webhook", "some-secret"); err != nil {
+		t.Errorf("checkWebhookConfig(both set) error = %v, want nil", err)
+	}
+}
