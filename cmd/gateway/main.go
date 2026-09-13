@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,7 +18,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"github.com/Snipa22/go-tari-lib/walletGRPC"
 
 	"github.com/Snipa22/taripay-gateway/internal/admin"
@@ -27,6 +30,14 @@ import (
 	"github.com/Snipa22/taripay-gateway/internal/invoice"
 	"github.com/Snipa22/taripay-gateway/internal/webhook"
 )
+
+// version is this binary's version stamp — the task brief part 4 (I13/I27)
+// version-stamp fix. Overridden at build time via
+// `-ldflags "-X main.version=<value>"` (see docker/gateway/Dockerfile's
+// `go build` invocation); left as "dev" for local/unstamped builds (e.g. `go run`,
+// `go test`, or a manual `go build` with no ldflags override). Printed at startup
+// and exposed via GET /health's response body below.
+var version = "dev"
 
 // eventWatcherInitialBackoff/eventWatcherMaxBackoff bound the restart-with-backoff
 // loop around Watcher.Run below: on a stream error, wait, then retry, doubling the
@@ -57,6 +68,31 @@ const webhookRetryTickerInterval = 60 * time.Second
 // expires_at passing and the next sweep tick).
 const ttlSweepTickerInterval = 60 * time.Second
 
+// maxInvoiceBodyBytes caps POST /invoice's request body via http.MaxBytesReader
+// (task brief part 2, security-boundaries persona I5): this is an unauthenticated,
+// all-interfaces listener, so an unbounded request body is a trivial memory-
+// exhaustion vector. 64 KiB is a PLACEHOLDER, UNCONFIRMED value — same
+// "reasonable-sounding guess, not project-owner-approved" caveat as
+// eventWatcherMaxBackoff/webhookRetryTickerInterval above: a createInvoiceRequest
+// body is two small string/int fields and will never legitimately approach this
+// size, so 64 KiB leaves generous headroom while still bounding the worst case.
+const maxInvoiceBodyBytes = 64 * 1024
+
+// httpServer{Read,ReadHeader,Write,Idle}Timeout bound how long the unauthenticated
+// http.Server below will wait on a slow/stalled client at each stage of a request
+// (task brief part 2, security-boundaries persona I5) — an unbounded default
+// timeout on an all-interfaces listener is a slow-client resource-exhaustion
+// vector (a client that opens a connection and trickles bytes, or never sends a
+// body, ties up a server goroutine indefinitely). All four are PLACEHOLDER,
+// UNCONFIRMED values, same caveat as maxInvoiceBodyBytes above — "reasonable
+// defaults for a small JSON API", not load-tested or project-owner-approved.
+const (
+	httpServerReadHeaderTimeout = 10 * time.Second
+	httpServerReadTimeout       = 30 * time.Second
+	httpServerWriteTimeout      = 30 * time.Second
+	httpServerIdleTimeout       = 60 * time.Second
+)
+
 func main() {
 	configFile := flag.String("config", "", "Path to a TOML config file (env: TARIPAY_CONFIG_FILE)")
 	walletGRPCAddr := flag.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
@@ -65,7 +101,13 @@ func main() {
 	webhookCallbackURL := flag.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
 	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default; required if webhook-callback-url is set — startup fails otherwise)")
 	adminAuthToken := flag.String("admin-auth-token", "", "Shared bearer token required on all /admin* routes (env: TARIPAY_ADMIN_AUTH_TOKEN; no default, admin routes are NOT registered at all if unset)")
+	printVersion := flag.Bool("version", false, "Print the gateway version and exit")
 	flag.Parse()
+
+	if *printVersion {
+		fmt.Println(version)
+		return
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -162,13 +204,17 @@ func main() {
 		log.Fatalf("gateway: admin: %v", err)
 	}
 
-	handler := newHandler(invoiceStore, time.Duration(cfg.InvoiceTTLMinutes)*time.Minute)
+	handler := newHandler(invoiceStore, time.Duration(cfg.InvoiceTTLMinutes)*time.Minute, database.Pool, walletGRPC.GetWalletConnectivity, version)
 	registerAdminRoutes(handler, adminServer, cfg.AdminAuthToken)
 
-	log.Printf("gateway: listening on %s (wallet grpc: %s)", cfg.HTTPListenAddr, cfg.WalletGRPCAddress)
+	log.Printf("gateway: version %s, listening on %s (wallet grpc: %s)", version, cfg.HTTPListenAddr, cfg.WalletGRPCAddress)
 	httpServer := &http.Server{
-		Addr:    cfg.HTTPListenAddr,
-		Handler: handler,
+		Addr:              cfg.HTTPListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpServerReadHeaderTimeout,
+		ReadTimeout:       httpServerReadTimeout,
+		WriteTimeout:      httpServerWriteTimeout,
+		IdleTimeout:       httpServerIdleTimeout,
 	}
 
 	go func() {
@@ -378,6 +424,15 @@ func runTTLSweepLoop(ctx context.Context, invoiceStore *invoice.Store, interval 
 }
 
 // createInvoiceRequest is the JSON body accepted by POST /invoice.
+//
+// AmountUTari is decoded as uint64 (matching go-tari-lib's own convention, and this
+// package's public invoiceResponse shape) rather than int64, specifically so the
+// explicit math.MaxInt64 upper-bound check in the POST /invoice handler below can
+// catch an oversized value BEFORE it's ever cast to int64 for storage — decoding
+// straight into int64 would let json.Decoder itself silently produce a negative
+// number for any input above math.MaxInt64 (wraparound), which is exactly the
+// silent-negative-BIGINT bug this check (task brief part 2, security-boundaries
+// persona I5) closes.
 type createInvoiceRequest struct {
 	OrderRef    string `json:"order_ref"`
 	AmountUTari uint64 `json:"amount_utari"`
@@ -416,8 +471,19 @@ func toInvoiceResponse(inv *invoice.Invoice) invoiceResponse {
 }
 
 // errorResponse is the JSON shape returned for any 4xx/5xx error.
+//
+// CorrelationID is only ever populated for the 502/500 "something failed on our
+// end" paths (task brief part 3, I4 security-boundaries persona) — the generic
+// message it accompanies deliberately omits the real error's text (a wallet gRPC
+// dial address, pgx/SQL error detail, etc.) since this is an unauthenticated API
+// response, but an operator investigating a bug report can grep the server log for
+// this exact ID to find the real error logAndCorrelate recorded server-side. 4xx
+// client-input-validation errors (bad JSON, missing/invalid fields) do not set
+// this — those messages describe the CLIENT's mistake, not an internal failure,
+// and were never the leak this fix closes.
 type errorResponse struct {
-	Error string `json:"error"`
+	Error         string `json:"error"`
+	CorrelationID string `json:"correlation_id,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -430,16 +496,91 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
 }
 
-// newHandler builds the Phase 1a HTTP surface: POST /invoice (create) and GET
-// /invoice/{id} (fetch current state). Returns the concrete *http.ServeMux (rather
+// logAndCorrelate logs the full detail of a server-side failure (context describes
+// where it happened, err is the real error — a wallet gRPC dial address, a pgx/SQL
+// error, etc.) alongside a freshly generated correlation ID, and returns that ID.
+// Callers embed the returned ID in a generic, detail-free message sent to the
+// client (see errorResponse's doc comment) — this is the link an operator uses to
+// find the matching full-detail log line from a user's bug report.
+//
+// This is task brief part 3's (I4 security-boundaries persona) fix: internal error
+// text must never reach an unauthenticated API client verbatim. A per-request UUID
+// generated inline is deliberately used instead of a full request-ID middleware
+// framework — checked first: neither net/http's httputil nor any existing code in
+// this repo has a request-ID precedent to build on, and this repo's error paths are
+// few enough that inline generation at each one is simpler than introducing a new
+// middleware layer for it.
+func logAndCorrelate(context string, err error) string {
+	id := uuid.New().String()
+	log.Printf("gateway: %s: [correlation_id=%s] %v", context, id, err)
+	return id
+}
+
+// writeGenericError logs err's full detail (via logAndCorrelate) and writes a
+// generic, correlation-ID-bearing error response to the client — the combined
+// "don't leak, but stay correlatable" response half of the part 3 fix, factored out
+// since both POST /invoice's 502 path and GET /invoice/{id}'s 500 path need the
+// exact same shape.
+func writeGenericError(w http.ResponseWriter, status int, logContext string, err error, clientMsg string) {
+	id := logAndCorrelate(logContext, err)
+	writeJSON(w, status, errorResponse{Error: clientMsg, CorrelationID: id})
+}
+
+// healthResponse is the JSON body returned by GET /health (task brief part 4,
+// I13/I27) — deliberately a superset of the brief's exact
+// {"status":"ok","wallet_connected":bool,"db_connected":bool} example, adding
+// Version (see this file's `version` var doc comment) so an operator hitting
+// /health can also confirm which build is actually running.
+type healthResponse struct {
+	Status          string `json:"status"`
+	WalletConnected bool   `json:"wallet_connected"`
+	DBConnected     bool   `json:"db_connected"`
+	Version         string `json:"version"`
+}
+
+// healthCheckTimeout bounds how long GET /health's handler will wait on the
+// wallet-connectivity/DB-ping checks below before giving up — task brief part 4
+// (I13/I27): a health/readiness probe must itself resolve quickly and
+// deterministically (an orchestrator polling this route on a short interval should
+// never have its probe request itself hang indefinitely on a wedged dependency).
+// 5s is a PLACEHOLDER, UNCONFIRMED value, same caveat as this file's other
+// tunables — a generous-but-bounded guess for a same-host/same-network wallet
+// gRPC daemon and Postgres instance, not load-tested or project-owner-approved.
+const healthCheckTimeout = 5 * time.Second
+
+// getWalletConnectivityFunc matches walletGRPC.GetWalletConnectivity's exact
+// signature (task brief part 4: "CONFIRMED available in the exact pinned
+// go-tari-lib dependency this repo uses"). Tests inject a fake instead of the real
+// function so they never touch a real wallet gRPC connection or global walletGRPC
+// package state — same DI pattern as invoice.ResolveAddressFunc/admin.IdentifyFunc.
+type getWalletConnectivityFunc func() (*tari_generated.CheckConnectivityResponse, error)
+
+// newHandler builds the Phase 1a HTTP surface: POST /invoice (create), GET
+// /invoice/{id} (fetch current state), and (task brief part 4) GET /health
+// (liveness/readiness probe, no auth). Returns the concrete *http.ServeMux (rather
 // than the http.Handler interface) so main() can register Phase 1b's admin routes
 // onto the same mux afterwards via adminServer.RegisterRoutes — see that method's own
 // doc comment for why routes are composed this way instead of each package owning its
 // own top-level handler.
-func newHandler(store *invoice.Store, defaultTTL time.Duration) *http.ServeMux {
+//
+// pool/getWalletConnectivity/buildVersion back GET /health's dependency checks and
+// version stamp specifically — pool may be nil in tests that don't exercise
+// /health (its DB check then always reports unreachable rather than panicking),
+// and getWalletConnectivity may likewise be nil (its check then always reports
+// unreachable).
+func newHandler(store *invoice.Store, defaultTTL time.Duration, pool *pgxpool.Pool, getWalletConnectivity getWalletConnectivityFunc, buildVersion string) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /invoice", func(w http.ResponseWriter, r *http.Request) {
+		// Body-size cap (task brief part 2, security-boundaries persona I5):
+		// this is an unauthenticated, all-interfaces listener, so an
+		// unbounded request body is a memory-exhaustion vector. A body over
+		// the limit makes r.Body's next Read return an *http.MaxBytesError,
+		// which json.NewDecoder surfaces as a normal Decode error below —
+		// handled identically to any other malformed-body case, i.e. a
+		// clean 400, never a panic/500.
+		r.Body = http.MaxBytesReader(w, r.Body, maxInvoiceBodyBytes)
+
 		var req createInvoiceRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -453,14 +594,29 @@ func newHandler(store *invoice.Store, defaultTTL time.Duration) *http.ServeMux {
 			writeError(w, http.StatusBadRequest, "amount_utari must be greater than 0")
 			return
 		}
+		// Upper-bound check (task brief part 2, security-boundaries persona
+		// I5): amount_utari is persisted as a Postgres BIGINT (signed
+		// int64) — see internal/invoice.Store.Create's `int64(inv.AmountUTari)`
+		// cast. A value above math.MaxInt64 would silently become negative
+		// there (two's-complement wraparound) and be misread back via
+		// uint64() wraparound on the way out. Rejecting it here, before it
+		// ever reaches store.Create, is simpler and clearer than trying to
+		// detect/repair a wrapped-around value after the fact.
+		if req.AmountUTari > math.MaxInt64 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("amount_utari must not exceed %d", uint64(math.MaxInt64)))
+			return
+		}
 
 		inv, err := store.Create(r.Context(), req.OrderRef, req.AmountUTari, defaultTTL)
 		if err != nil {
 			// Wallet address resolution failure (or any other Create failure) is
 			// reported as a 502: the request was well-formed, but this gateway
 			// could not complete it because an upstream dependency (the wallet)
-			// failed.
-			writeError(w, http.StatusBadGateway, "failed to create invoice: "+err.Error())
+			// failed. The real error (which may contain the wallet gRPC dial
+			// address) is logged server-side only — task brief part 3, I4
+			// security-boundaries persona — never returned verbatim to this
+			// unauthenticated client.
+			writeGenericError(w, http.StatusBadGateway, "create invoice", err, "failed to create invoice: an upstream dependency (the wallet) could not complete this request")
 			return
 		}
 
@@ -481,11 +637,63 @@ func newHandler(store *invoice.Store, defaultTTL time.Duration) *http.ServeMux {
 				writeError(w, http.StatusNotFound, "invoice not found")
 				return
 			}
-			writeError(w, http.StatusInternalServerError, "failed to fetch invoice: "+err.Error())
+			// Any other GetByID failure is a genuine internal error (e.g. a
+			// pgx/SQL-level failure) — same "log full detail server-side,
+			// return a generic correlatable message" treatment as the
+			// wallet failure above (task brief part 3, I4 security-
+			// boundaries persona): a raw pgx/SQL error string must never
+			// reach this unauthenticated client.
+			writeGenericError(w, http.StatusInternalServerError, "fetch invoice", err, "failed to fetch invoice")
 			return
 		}
 
 		writeJSON(w, http.StatusOK, toInvoiceResponse(inv))
+	})
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		// No auth required (task brief part 4, I13/I27): this is an
+		// infra-level liveness/readiness probe (e.g. a Docker HEALTHCHECK
+		// or an orchestrator's readiness probe), not an admin route — see
+		// docker/gateway/Dockerfile's HEALTHCHECK, which hits this route via
+		// cmd/healthcheck's tiny standalone binary (distroless has no shell/
+		// curl to do so directly).
+		ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+		defer cancel()
+
+		walletConnected := false
+		if getWalletConnectivity != nil {
+			if resp, err := getWalletConnectivity(); err != nil {
+				log.Printf("gateway: health: wallet connectivity check: %v", err)
+			} else {
+				walletConnected = resp.GetStatus() == tari_generated.CheckConnectivityResponse_Online
+			}
+		}
+
+		dbConnected := false
+		if pool != nil {
+			if err := pool.Ping(ctx); err != nil {
+				log.Printf("gateway: health: db ping: %v", err)
+			} else {
+				dbConnected = true
+			}
+		}
+
+		status := http.StatusOK
+		overall := "ok"
+		if !walletConnected || !dbConnected {
+			// 503, not 200 (task brief part 4's explicit requirement): an
+			// orchestrator's health/readiness probe must actually reflect
+			// readiness, not just "the HTTP listener answered".
+			status = http.StatusServiceUnavailable
+			overall = "unavailable"
+		}
+
+		writeJSON(w, status, healthResponse{
+			Status:          overall,
+			WalletConnected: walletConnected,
+			DBConnected:     dbConnected,
+			Version:         buildVersion,
+		})
 	})
 
 	return mux
