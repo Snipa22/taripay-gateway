@@ -123,6 +123,17 @@ func NewWatcher(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender
 // which this field never emits. Do not "fix" this back to underscore-separated
 // TRANSACTION_STATUS_* matching; that is TransactionInfo.Status's format, not this
 // one's.
+//
+// FIX (S5/AI-06, 2026-09-13 deep readiness review, live-verified evidence cited in
+// this fix's own commit): a normal interactive payment's very first status is
+// "Completed" (negotiated, not yet broadcast) — this is NOT a rejection, but before
+// this fix it fell into the default branch below and fired a false
+// payment.rejected webhook before the same payment later correctly progressed to
+// seen/confirmed. "Queued"/"Imported"/"Coinbase" are the same story: all
+// legitimate, in-progress-or-otherwise-valid, non-terminal wallet states, none of
+// them a rejection. The default branch below is now scoped to genuinely
+// unexpected/rejection-shaped statuses only ("Rejected", unrecognized values) — see
+// its own comment.
 func mapStatus(status string) (invoiceStatus, webhookEvent string) {
 	upper := strings.ToUpper(status)
 	switch {
@@ -131,11 +142,23 @@ func mapStatus(status string) (invoiceStatus, webhookEvent string) {
 	case strings.Contains(upper, "BROADCAST"), strings.Contains(upper, "PENDING"),
 		strings.Contains(upper, "MINED UNCONFIRMED"), strings.Contains(upper, "ONE-SIDED UNCONFIRMED"):
 		return invoice.StatusSeen, "payment.seen"
+	case strings.Contains(upper, "COMPLETED"), strings.Contains(upper, "QUEUED"),
+		strings.Contains(upper, "IMPORTED"), strings.Contains(upper, "COINBASE"):
+		// All valid, in-progress/non-terminal wallet states (S5/AI-06 fix, see
+		// this function's doc comment) — "Completed" in particular is a normal
+		// interactive payment's very first status, pre-broadcast, not a
+		// rejection.
+		return invoice.StatusSeen, "payment.seen"
 	default:
-		// REJECTED, NOT_FOUND, or any other/unrecognized status: treat as a
+		// Genuinely unexpected/rejection-shaped statuses only: REJECTED,
+		// NOT_FOUND, or any other truly unrecognized value — treat as a
 		// chain-level rejection, distinct from a merchant/customer-initiated
 		// cancellation — see invoice.StatusRejected's doc comment for why this
 		// is its own status value rather than reusing invoice.StatusCancelled.
+		// This is deliberately NOT a catch-all for "anything not on the happy
+		// path" anymore (that was the S5/AI-06 bug this fix closes) — every
+		// known valid in-progress/non-terminal status has its own explicit
+		// case above now.
 		return invoice.StatusRejected, "payment.rejected"
 	}
 }
@@ -243,7 +266,8 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 //
 // status must already be in the same short, space/hyphen-separated wire form
 // mapStatus expects (mapStatus itself is unchanged by this refactor — see that
-// function's doc comment).
+// function's doc comment) — transactionInfoStatusText below is the adapter that
+// produces this form from TransactionInfo.Status's long enum-name form.
 func (w *Watcher) handleTransaction(ctx context.Context, paymentID, txID, status string, amount uint64) {
 	inv, err := w.invoiceStore.GetByPaymentID(ctx, paymentID)
 	if err != nil {
