@@ -314,10 +314,41 @@ func (w *Watcher) handleTransaction(ctx context.Context, paymentID, txID, status
 		}
 		amountReceived = total
 
-		if total < inv.AmountUTari {
+		switch {
+		case total < inv.AmountUTari:
 			newStatus = invoice.StatusUnderpaid
 			webhookEvent = "payment.underpaid"
-		} else {
+		case time.Now().UTC().After(inv.ExpiresAt):
+			// TTL confirm-time check (task brief part 2, item 2): a periodic
+			// ExpireStale sweep (see cmd/gateway's runTTLSweepLoop) alone can
+			// still lose a race against a payment landing in the exact window
+			// between the invoice's expires_at passing and the next sweep
+			// tick — this check closes that window at the only point that
+			// actually matters, confirm time, rather than relying on sweep
+			// timing alone. A payment that would otherwise confirm but
+			// arrives after expires_at is a genuinely interesting case (a
+			// late payment to an abandoned order) worth its own loud log
+			// line, not a silent drop — the merchant can still see it via
+			// AmountReceivedUTari (already updated by AddReceivedAmount
+			// above) and the invoice's `expired` status through GetByID/
+			// List/the admin UI even though no webhook fires for it.
+			//
+			// Decision (call this out explicitly, not an oversight, per the
+			// task brief): this does NOT introduce a new `payment.late`
+			// webhook event in this pass. Doing so would be a merchant-
+			// plugin-contract change (a new event value the WooCommerce
+			// plugin, built separately, would need to learn to handle), not
+			// just a gateway-internal fix — out of scope here and flagged
+			// for the project owner (Alex) to decide on separately, same
+			// "flag as unconfirmed, don't silently decide it" treatment
+			// AGENTS.md requires for the confirmation-depth/TTL/overpayment-
+			// tolerance defaults.
+			log.Printf("eventwatcher: LATE PAYMENT: invoice %s (payment_id=%s, order_ref=%s) received a confirming amount (%d/%d utari, tx_id=%s) AFTER its expires_at (%s, now %s) — leaving status expired, NOT firing payment.confirmed", inv.ID, inv.PaymentID, inv.OrderRef, total, inv.AmountUTari, txID, inv.ExpiresAt.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+			if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, invoice.StatusExpired, nil); err != nil {
+				log.Printf("eventwatcher: update status for invoice %s to %q (late payment): %v", inv.ID, invoice.StatusExpired, err)
+			}
+			return
+		default:
 			now := time.Now().UTC()
 			confirmedAt = &now
 		}

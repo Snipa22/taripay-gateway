@@ -399,3 +399,57 @@ func TestRunWebhookRetryLoop_StopsOnContextCancellation(t *testing.T) {
 		t.Fatal("runWebhookRetryLoop did not return within 2s of context cancellation")
 	}
 }
+
+// ---- runTTLSweepLoop tests (TTL enforcement fix, task brief part 2, item 1) ----
+
+// TestRunTTLSweepLoop_StopsOnContextCancellation confirms runTTLSweepLoop's
+// goroutine is actually wired to, and respects, its shutdown context — same
+// "goroutine started, cancellation respected" shape as
+// TestRunWebhookRetryLoop_StopsOnContextCancellation above, which this test's
+// structure mirrors per the task brief's explicit precedent.
+func TestRunTTLSweepLoop_StopsOnContextCancellation(t *testing.T) {
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	invoiceStore := invoice.NewStore(pool, func(paymentID string) (string, error) {
+		return "fake-address-for-" + paymentID, nil
+	})
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runTTLSweepLoop(runCtx, invoiceStore, 5*time.Millisecond)
+		close(done)
+	}()
+
+	// Give it a moment to actually start ticking (an empty invoices table means
+	// each tick's ExpireStale call is a fast, harmless no-op) before cancelling.
+	time.Sleep(20 * time.Millisecond)
+	runCancel()
+
+	select {
+	case <-done:
+		// runTTLSweepLoop returned promptly after cancellation, as expected.
+	case <-time.After(2 * time.Second):
+		t.Fatal("runTTLSweepLoop did not return within 2s of context cancellation")
+	}
+}

@@ -964,3 +964,60 @@ func TestReconcile_OutboundTransactionsAreIgnored(t *testing.T) {
 		t.Errorf("spy.callCount() = %d, want 0", got)
 	}
 }
+
+// ---- TTL enforcement tests (task brief part 2) ----
+
+// TestRun_LatePaymentAfterExpiryDoesNotConfirm covers the TTL confirm-time check
+// (task brief part 2, item 2): an event that would otherwise confirm an invoice, but
+// arrives after the invoice's expires_at has already passed, must NOT confirm it —
+// the invoice must end up StatusExpired (not StatusConfirmed), ConfirmedAt must stay
+// nil, and no payment.confirmed webhook (or any webhook at all, per this fix's
+// documented decision not to add a payment.late event) must fire.
+func TestRun_LatePaymentAfterExpiryDoesNotConfirm(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	// A negative TTL means the invoice is already past its expires_at the
+	// moment it's created — simpler and more deterministic than sleeping past a
+	// short positive TTL in a test.
+	inv, err := invoiceStore.Create(ctx, "order-late-payment", 1000, -time.Minute)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	if inv.Status != invoice.StatusPending {
+		t.Fatalf("precondition: invoice.Status = %q, want %q", inv.Status, invoice.StatusPending)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-late-1", 1000),
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusExpired {
+		t.Errorf("Status = %q, want %q (late payment to an abandoned invoice must not confirm it)", got.Status, invoice.StatusExpired)
+	}
+	if got.ConfirmedAt != nil {
+		t.Errorf("ConfirmedAt = %v, want nil (invoice never actually confirmed)", got.ConfirmedAt)
+	}
+
+	if got := spy.callCount(); got != 0 {
+		t.Errorf("spy.callCount() = %d, want 0 (no payment.confirmed webhook, per this fix's documented decision)", got)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 0 {
+		t.Errorf("len(deliveries) = %d, want 0", len(deliveries))
+	}
+}
