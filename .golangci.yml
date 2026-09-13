@@ -1,0 +1,46 @@
+# golangci-lint v2 config (schema requires the top-level `version: "2"` key — v1's
+# flat linter-name list under `linters:`/`linters-settings:` was restructured in v2
+# into `linters.default` + `linters.enable` plus a separate `formatters` section).
+# Confirmed against golangci-lint 2.13.2 (`golangci-lint version` / `golangci-lint
+# linters` in this repo's dev sandbox) — see AGENTS.md / CI docs for the pinned
+# version used in .github/workflows/ci.yml.
+#
+# This is this org's first golangci-lint config (no existing convention to copy from
+# a sibling repo). Deliberately small for a first-time introduction to an existing,
+# already-merged codebase: the five linters below are exactly `golangci-lint`'s own
+# *default* enabled set in v2.13.2 (confirmed by running `golangci-lint linters` with
+# no config file present) — govet/ineffassign/unused/errcheck plus `staticcheck`,
+# which in this golangci-lint version already bundles what used to be separate
+# `staticcheck`/`gosimple`/`stylecheck` linters in v1. `govet` is redundant with the
+# CI job's standalone `go vet ./...` step but harmless to double up (it also gets
+# golangci-lint's caching/diff-aware-run benefits). Not enabling anything stricter
+# (gocritic, revive, gosec, etc.) yet — do that as a deliberate follow-up once the
+# team has lived with this baseline for a bit, not as part of this first pass.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  exclusions:
+    # Future-proofing: this repo has no generated code today (no protoc/mockgen/etc.
+    # output checked in), but if that changes, skip linting it rather than needing a
+    # per-file exclusion rule added later. "lax" only recognizes the standard
+    # `// Code generated ... DO NOT EDIT.` header convention.
+    generated: lax
+    rules:
+      # Test helper error-ignoring is common and fine (e.g. deferred
+      # resp.Body.Close() on an httptest server response, cleanup helpers, etc.) —
+      # relax errcheck there rather than forcing every test file to handle errors
+      # that don't affect test correctness.
+      - linters:
+          - errcheck
+        path: _test\.go
+
+formatters:
+  enable:
+    - gofmt

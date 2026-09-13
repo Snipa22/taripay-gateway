@@ -267,7 +267,7 @@ func (s *Sender) Send(ctx context.Context, callbackURL string, payload []byte) (
 	if err != nil {
 		return 0, fmt.Errorf("webhook: send: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close on an already-completed response; failure here is inconsequential.
 	// Drain and discard the response body so the connection can be reused by the
 	// underlying transport; we don't care about the merchant endpoint's response
 	// content, only its status code.
