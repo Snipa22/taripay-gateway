@@ -482,6 +482,154 @@ func TestRun_OverpaymentConfirmsNormally(t *testing.T) {
 	}
 }
 
+// TestRun_TerminalStatusGuard_ConfirmedIgnoresLaterSeenEvent covers the S2/AI-05 fix
+// (task brief part 1): once an invoice is confirmed (a terminal status), a later
+// event that would otherwise map to "seen" must be completely ignored — status stays
+// confirmed, confirmed_at is NOT nulled, and no second webhook fires.
+func TestRun_TerminalStatusGuard_ConfirmedIgnoresLaterSeenEvent(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-terminal-seen", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-1", 1000), // confirms
+		inboundEvent(inv.PaymentID, "Broadcast", "tx-2"),                       // stray later "seen" event, must be ignored
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q (must not regress to seen)", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it still set (must not be nulled by the later ignored event)")
+	}
+
+	if got := spy.callCount(); got != 1 {
+		t.Errorf("spy.callCount() = %d, want 1 (only the initial confirm; the later post-terminal event fires no webhook)", got)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Errorf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+}
+
+// TestRun_TerminalStatusGuard_ConfirmedIgnoresLaterRejectedEvent is the same guard,
+// exercised with a later event that would otherwise map to "rejected" instead of
+// "seen" — confirms the guard isn't accidentally scoped to only one downgrade
+// direction.
+func TestRun_TerminalStatusGuard_ConfirmedIgnoresLaterRejectedEvent(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-terminal-rejected-after-confirm", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-1", 1000), // confirms
+		inboundEvent(inv.PaymentID, "Rejected", "tx-2"),                        // stray later "rejected" event, must be ignored
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q (must not downgrade to rejected)", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it still set (must not be nulled by the later ignored event)")
+	}
+
+	if got := spy.callCount(); got != 1 {
+		t.Errorf("spy.callCount() = %d, want 1 (only the initial confirm; no webhook for the ignored rejected event)", got)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Errorf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+}
+
+// TestRun_TerminalStatusGuard_RejectedIgnoresLaterConfirmedEvent covers the reverse
+// direction: a rejected (terminal) invoice must not be "revived" to confirmed by a
+// later event, and — critically — AddReceivedAmount must not even run for it (the
+// terminal check happens before any amount accumulation), so AmountReceivedUTari
+// stays untouched too.
+func TestRun_TerminalStatusGuard_RejectedIgnoresLaterConfirmedEvent(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-terminal-rejected-revive", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEvent(inv.PaymentID, "Rejected", "tx-1"),                        // rejects
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-2", 1000), // stray later "confirmed" event, must be ignored
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusRejected {
+		t.Errorf("Status = %q, want %q (must not be revived to confirmed)", got.Status, invoice.StatusRejected)
+	}
+	if got.ConfirmedAt != nil {
+		t.Errorf("ConfirmedAt = %v, want nil (invoice never actually confirmed)", got.ConfirmedAt)
+	}
+	if got.AmountReceivedUTari != 0 {
+		t.Errorf("AmountReceivedUTari = %d, want 0 (AddReceivedAmount must not run for a terminal invoice)", got.AmountReceivedUTari)
+	}
+
+	if got := spy.callCount(); got != 1 {
+		t.Errorf("spy.callCount() = %d, want 1 (only the rejected transition; no webhook for the ignored confirmed event)", got)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Errorf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+}
+
 // TestRun_StreamErrorIsReturned verifies a non-nil error from the error channel is
 // logged and returned as-is (no retry logic inside Run itself).
 func TestRun_StreamErrorIsReturned(t *testing.T) {

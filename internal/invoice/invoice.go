@@ -89,6 +89,32 @@ const (
 	StatusUnderpaid = "underpaid"
 )
 
+// TerminalStatuses is the single source of truth for which invoice statuses are
+// terminal: once an invoice reaches any of these, no later wallet event may change
+// its status again, regardless of what a subsequent event's mapped status would
+// otherwise be — see internal/eventwatcher's isTerminalStatus/handleEvent for the
+// actual enforcement point (the fix-transitions-and-webhook-retry task brief's part
+// 1, S2/AI-05: without this guard, a stray re-broadcast status echo or a
+// reorg-driven re-emit of an unconfirmed status for an already-mined tx could move a
+// confirmed/rejected/expired/cancelled invoice backwards, nulling confirmed_at and
+// firing a webhook for a payment that already succeeded/failed/lapsed).
+//
+// Defined here, package-level, rather than only inside internal/eventwatcher, so any
+// other package that ever needs the same notion (e.g. a future reconciliation sweep)
+// has one place to reference instead of redefining its own list.
+//
+// StatusPending, StatusSeen, StatusUnderpaid are deliberately NOT included: an
+// invoice must still be able to transition normally between these — including the
+// existing StatusUnderpaid -> StatusConfirmed top-up path (the C2 fix, see
+// AddReceivedAmount's doc comment) — until it reaches one of the terminal statuses
+// below.
+var TerminalStatuses = map[string]bool{
+	StatusConfirmed: true,
+	StatusRejected:  true,
+	StatusExpired:   true,
+	StatusCancelled: true,
+}
+
 // ResolveAddressFunc resolves a payment ID to a wallet payment address. In production
 // this is wired to walletGRPC.GetPaymentIdAddress (see cmd/gateway/main.go); tests
 // inject a fake so they never touch a real wallet gRPC connection or global

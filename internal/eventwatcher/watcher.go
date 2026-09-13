@@ -136,6 +136,15 @@ func mapStatus(status string) (invoiceStatus, webhookEvent string) {
 	}
 }
 
+// isTerminalStatus reports whether status is one of invoice.TerminalStatuses — see
+// that var's doc comment (task brief part 1, S2/AI-05 fix) for the full rationale.
+// Used by handleEvent to guard against a later wallet event (a stray re-broadcast
+// status echo, or a reorg-driven re-emit of an unconfirmed status for an
+// already-mined tx) moving an already-terminal invoice backwards.
+func isTerminalStatus(status string) bool {
+	return invoice.TerminalStatuses[status]
+}
+
 // Run opens the wallet's transaction-event stream and processes events until the
 // stream ends (cleanly, or with an error) or ctx is cancelled. On a stream error
 // (non-nil value from the error channel) it logs and returns the error; on ctx
@@ -232,6 +241,20 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 
 	mappedStatus, webhookEvent := mapStatus(txn.Status)
 	previousStatus := inv.Status
+
+	// Terminal-state guard (task brief part 1, S2/AI-05 fix): once an invoice has
+	// reached a terminal status (invoice.TerminalStatuses — confirmed, rejected,
+	// expired, cancelled), NO later event may change it, full stop, regardless of
+	// what mapStatus computed for this event. This must run before the
+	// AddReceivedAmount/UpdateStatus/webhook logic below entirely — not just
+	// before UpdateStatus — so a stray re-broadcast/reorg-driven event on an
+	// already-terminal invoice also can't corrupt AmountReceivedUTari's running
+	// total. This is not an error: reorgs and duplicate/stray events are expected
+	// wallet behavior, not a bug in this gateway.
+	if isTerminalStatus(previousStatus) {
+		log.Printf("eventwatcher: invoice %s already in terminal status %q, ignoring post-terminal event (tx_id=%s, computed_status=%q)", inv.ID, previousStatus, txn.TxId, mappedStatus)
+		return
+	}
 
 	// newStatus/confirmedAt/amountReceived default to mappedStatus's own verdict
 	// and are only overridden below for the confirmed-vs-underpaid decision (the
