@@ -63,7 +63,7 @@ func main() {
 	postgresDSN := flag.String("postgres-dsn", "", "Postgres connection string (env: TARIPAY_POSTGRES_DSN; required, no default)")
 	httpAddr := flag.String("http-addr", "", "HTTP listen address (env: TARIPAY_HTTP_LISTEN_ADDR; default: "+config.DefaultHTTPListenAddr+")")
 	webhookCallbackURL := flag.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
-	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default, webhook delivery disabled if unset)")
+	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default; required if webhook-callback-url is set — startup fails otherwise)")
 	adminAuthToken := flag.String("admin-auth-token", "", "Shared bearer token required on all /admin* routes (env: TARIPAY_ADMIN_AUTH_TOKEN; no default, admin routes are NOT registered at all if unset)")
 	flag.Parse()
 
@@ -83,15 +83,8 @@ func main() {
 		log.Fatalf("gateway: %v", err)
 	}
 
-	// Per the task brief: an unset webhook callback URL/HMAC secret is NOT fatal —
-	// invoice creation/lookup must keep working standalone — but it IS worth a
-	// loud warning, since it silently means every invoice-status transition's
-	// webhook delivery will be skipped (see internal/eventwatcher.fireWebhook).
-	if cfg.WebhookCallbackURL == "" {
-		log.Printf("gateway: WARNING: no webhook callback URL configured (TARIPAY_WEBHOOK_CALLBACK_URL) — webhook delivery is disabled")
-	}
-	if cfg.WebhookHMACSecret == "" {
-		log.Printf("gateway: WARNING: no webhook HMAC secret configured (TARIPAY_WEBHOOK_HMAC_SECRET) — outgoing webhooks (if any) will be signed with an empty secret")
+	if err := checkWebhookConfig(cfg.WebhookCallbackURL, cfg.WebhookHMACSecret); err != nil {
+		log.Fatalf("gateway: %v", err)
 	}
 
 	// Unlike the webhook fields above, an unset admin auth token is NOT just a
@@ -189,6 +182,47 @@ func main() {
 		log.Fatalf("gateway: %v", err)
 	}
 	log.Printf("gateway: shutting down")
+}
+
+// checkWebhookConfig resolves the combined webhook-callback-URL/HMAC-secret startup
+// check (the S3 fail-open-HMAC-secret fix, task brief part 3): the two fields used
+// to be validated independently (each just its own "warn and keep going" if unset),
+// which meant a callback URL configured WITHOUT an HMAC secret still built a working
+// webhook.Sender and sent real webhooks — signed with an empty key anyone can
+// compute, i.e. a "valid" signature that proves nothing. This function is the one
+// place that now decides all four combinations:
+//
+//   - both unset: warn and skip (unchanged from before — webhook delivery is simply
+//     disabled, invoice creation/lookup keeps working standalone). Returns nil.
+//   - callback URL unset, secret set: warn and skip (unchanged) — a secret with no
+//     callback URL to sign anything for is harmless, just pointless configuration.
+//     Returns nil.
+//   - callback URL set, secret unset: FATAL. Per the review's exact framing (cited
+//     here, not re-derived): "no callback URL => no webhooks; a callback URL with a
+//     computable empty-key signature is worse than no signature at all." Returns a
+//     non-nil error describing this; main() below turns that into a log.Fatalf at
+//     startup — simpler to reason about than trying to suppress sending at request
+//     time — rather than a runtime behavior change deep inside
+//     internal/eventwatcher/internal/webhook.
+//   - both set: normal operation, nothing to log. Returns nil.
+//
+// Returning an error here (rather than calling log.Fatalf directly) keeps this
+// function itself trivially unit-testable — see TestCheckWebhookConfig_* in
+// main_test.go — without needing a subprocess harness to observe an os.Exit.
+func checkWebhookConfig(callbackURL, hmacSecret string) error {
+	switch {
+	case callbackURL == "" && hmacSecret == "":
+		log.Printf("gateway: WARNING: no webhook callback URL or HMAC secret configured (TARIPAY_WEBHOOK_CALLBACK_URL / TARIPAY_WEBHOOK_HMAC_SECRET) — webhook delivery is disabled")
+		return nil
+	case callbackURL == "" && hmacSecret != "":
+		log.Printf("gateway: WARNING: no webhook callback URL configured (TARIPAY_WEBHOOK_CALLBACK_URL) — webhook delivery is disabled (the configured HMAC secret is unused)")
+		return nil
+	case callbackURL != "" && hmacSecret == "":
+		return fmt.Errorf("webhook callback URL (TARIPAY_WEBHOOK_CALLBACK_URL=%q) is configured but no webhook HMAC secret (TARIPAY_WEBHOOK_HMAC_SECRET) is set — refusing to start: sending webhooks signed with an empty key produces a \"valid\" signature that proves nothing, which is worse than sending no signature at all. Set TARIPAY_WEBHOOK_HMAC_SECRET, or unset the callback URL to disable webhook delivery entirely", callbackURL)
+	default:
+		// Both set: normal operation.
+		return nil
+	}
 }
 
 // registerAdminRoutes registers adminServer's routes onto mux, gated on authToken
