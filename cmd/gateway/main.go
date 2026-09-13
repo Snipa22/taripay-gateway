@@ -45,6 +45,7 @@ func main() {
 	httpAddr := flag.String("http-addr", "", "HTTP listen address (env: TARIPAY_HTTP_LISTEN_ADDR; default: "+config.DefaultHTTPListenAddr+")")
 	webhookCallbackURL := flag.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
 	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default, webhook delivery disabled if unset)")
+	adminAuthToken := flag.String("admin-auth-token", "", "Shared bearer token required on all /admin* routes (env: TARIPAY_ADMIN_AUTH_TOKEN; no default, admin routes are NOT registered at all if unset)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -57,6 +58,7 @@ func main() {
 		HTTPListenAddr:     *httpAddr,
 		WebhookCallbackURL: *webhookCallbackURL,
 		WebhookHMACSecret:  *webhookHMACSecret,
+		AdminAuthToken:     *adminAuthToken,
 	})
 	if err != nil {
 		log.Fatalf("gateway: %v", err)
@@ -71,6 +73,20 @@ func main() {
 	}
 	if cfg.WebhookHMACSecret == "" {
 		log.Printf("gateway: WARNING: no webhook HMAC secret configured (TARIPAY_WEBHOOK_HMAC_SECRET) — outgoing webhooks (if any) will be signed with an empty secret")
+	}
+
+	// Unlike the webhook fields above, an unset admin auth token is NOT just a
+	// "warn and keep going" situation (S1/I19 admin-auth fix, task brief "fix
+	// C2 and add auth", part 2): the admin surface (wallet balance, every
+	// order, webhook-delivery replay) is a real, operator-only attack surface
+	// on an all-interfaces listener, and running it unauthenticated because the
+	// operator forgot to set one env var is exactly the finding this fix
+	// closes. So this is louder than a WARNING, and — critically — the admin
+	// routes are simply never registered on the mux at all below (see
+	// registerAdminRoutes), so /admin* 404s rather than silently serving
+	// unauthenticated.
+	if cfg.AdminAuthToken == "" {
+		log.Printf("gateway: WARNING: no admin auth token configured (TARIPAY_ADMIN_AUTH_TOKEN) — admin routes (/admin, /admin/invoices, /admin/webhooks/*/retry) will NOT be registered at all until this is set")
 	}
 
 	// InitWalletGRPC establishes the wallet gRPC connection go-tari-lib's walletGRPC
@@ -120,7 +136,7 @@ func main() {
 	}
 
 	handler := newHandler(invoiceStore, time.Duration(cfg.InvoiceTTLMinutes)*time.Minute)
-	adminServer.RegisterRoutes(handler)
+	registerAdminRoutes(handler, adminServer, cfg.AdminAuthToken)
 
 	log.Printf("gateway: listening on %s (wallet grpc: %s)", cfg.HTTPListenAddr, cfg.WalletGRPCAddress)
 	httpServer := &http.Server{
@@ -139,6 +155,22 @@ func main() {
 		log.Fatalf("gateway: %v", err)
 	}
 	log.Printf("gateway: shutting down")
+}
+
+// registerAdminRoutes registers adminServer's routes onto mux, gated on authToken
+// being configured (the S1/I19 admin-auth fix, task brief "fix C2 and add auth",
+// part 2): if authToken is empty, this deliberately does NOT call
+// adminServer.RegisterRoutes at all, so /admin* 404s (route not found) rather than
+// running unauthenticated or returning a merely-confusing 401 for every request —
+// a meaningfully different, more diagnostic signal that the operator forgot to
+// configure TARIPAY_ADMIN_AUTH_TOKEN, per the brief's explicit requirement. The
+// startup warning for this same condition is logged once in main() above; this
+// function only performs the actual (non-)registration.
+func registerAdminRoutes(mux *http.ServeMux, adminServer *admin.Server, authToken string) {
+	if authToken == "" {
+		return
+	}
+	adminServer.RegisterRoutes(mux, authToken)
 }
 
 // runEventWatcherWithBackoff supervises watcher.Run with restart-with-backoff on
