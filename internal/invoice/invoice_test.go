@@ -224,6 +224,65 @@ func TestAddReceivedAmount(t *testing.T) {
 	}
 }
 
+// TestListNonTerminal covers the reconciliation-after-downtime fix's prerequisite
+// (task brief part 1, S2/I7): seeds an invoice for every status value this package
+// defines and confirms ListNonTerminal returns exactly the non-terminal ones
+// (pending, seen, underpaid), excluding every status in TerminalStatuses (confirmed,
+// rejected, expired, cancelled).
+func TestListNonTerminal(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	seed := func(orderRef, status string) *Invoice {
+		inv, err := s.Create(ctx, orderRef, 100, time.Hour)
+		if err != nil {
+			t.Fatalf("Create(%s) error = %v", orderRef, err)
+		}
+		if status != StatusPending {
+			if err := s.UpdateStatus(ctx, inv.ID, status, nil); err != nil {
+				t.Fatalf("UpdateStatus(%s, %s) error = %v", orderRef, status, err)
+			}
+		}
+		return inv
+	}
+
+	pending := seed("order-nonterm-pending", StatusPending)
+	seen := seed("order-nonterm-seen", StatusSeen)
+	underpaid := seed("order-nonterm-underpaid", StatusUnderpaid)
+	confirmed := seed("order-nonterm-confirmed", StatusConfirmed)
+	rejected := seed("order-nonterm-rejected", StatusRejected)
+	expired := seed("order-nonterm-expired", StatusExpired)
+	cancelled := seed("order-nonterm-cancelled", StatusCancelled)
+
+	got, err := s.ListNonTerminal(ctx)
+	if err != nil {
+		t.Fatalf("ListNonTerminal() error = %v", err)
+	}
+
+	gotIDs := map[uuid.UUID]bool{}
+	for _, inv := range got {
+		gotIDs[inv.ID] = true
+	}
+
+	for _, tc := range []struct {
+		name   string
+		id     uuid.UUID
+		wantIn bool
+	}{
+		{"pending", pending.ID, true},
+		{"seen", seen.ID, true},
+		{"underpaid", underpaid.ID, true},
+		{"confirmed", confirmed.ID, false},
+		{"rejected", rejected.ID, false},
+		{"expired", expired.ID, false},
+		{"cancelled", cancelled.ID, false},
+	} {
+		if gotIDs[tc.id] != tc.wantIn {
+			t.Errorf("%s: present in ListNonTerminal() = %v, want %v", tc.name, gotIDs[tc.id], tc.wantIn)
+		}
+	}
+}
+
 func TestExpireStale(t *testing.T) {
 	s := setupStore(t, nil)
 	ctx := context.Background()

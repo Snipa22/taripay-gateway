@@ -137,6 +137,30 @@ func outboundEvent(paymentID, status, txID string) *tari_generated.TransactionEv
 	}
 }
 
+// inboundCompletedTxn builds a *tari_generated.TransactionInfo for
+// TestReconcile_*/getCompletedByPaymentID mocks below — the TransactionInfo-shaped
+// (long enum-name Direction/Status form, uint64 TxId) counterpart of
+// inboundEventWithAmount above, exercising Reconcile's own adapter step
+// (transactionInfoIsInbound/transactionInfoStatusText) rather than
+// handleEvent's.
+func inboundCompletedTxn(status tari_generated.TransactionStatus, txID uint64, amount uint64) *tari_generated.TransactionInfo {
+	return &tari_generated.TransactionInfo{
+		TxId:      txID,
+		Status:    status,
+		Direction: tari_generated.TransactionDirection_TRANSACTION_DIRECTION_INBOUND,
+		Amount:    amount,
+	}
+}
+
+func outboundCompletedTxn(status tari_generated.TransactionStatus, txID uint64, amount uint64) *tari_generated.TransactionInfo {
+	return &tari_generated.TransactionInfo{
+		TxId:      txID,
+		Status:    status,
+		Direction: tari_generated.TransactionDirection_TRANSACTION_DIRECTION_OUTBOUND,
+		Amount:    amount,
+	}
+}
+
 // TestRun_FullSequence exercises the brief's required scenario: an event for an
 // unrelated/unknown payment_id, a first-time "seen" transition, a first-time
 // "confirmed" transition, a repeat "confirmed" event that must NOT refire a webhook,
@@ -730,5 +754,213 @@ func TestRun_ContextCancellationReturnsContextErr(t *testing.T) {
 	err := w.Run(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+// ---- Reconcile tests (task brief part 1, S2/I7 reconciliation-after-downtime fix)
+// ----
+
+// TestReconcile_NonTerminalInvoiceConfirmsAndFiresWebhook covers Reconcile's core
+// scenario: a non-terminal invoice whose getCompletedByPaymentID mock returns a
+// confirmed transaction transitions to confirmed and fires a webhook — the exact
+// same outcome as if the equivalent event had arrived live.
+func TestReconcile_NonTerminalInvoiceConfirmsAndFiresWebhook(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-reconcile-confirm", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	calls := map[string]int{}
+	getCompleted := func(paymentID string) ([]*tari_generated.TransactionInfo, error) {
+		calls[paymentID]++
+		if paymentID != inv.PaymentID {
+			return nil, nil
+		}
+		return []*tari_generated.TransactionInfo{
+			inboundCompletedTxn(tari_generated.TransactionStatus_TRANSACTION_STATUS_MINED_CONFIRMED, 42, 1000),
+		}, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.Reconcile(ctx, getCompleted)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Reconcile() examined = %d, want 1", n)
+	}
+	if calls[inv.PaymentID] != 1 {
+		t.Errorf("getCompletedByPaymentID called %d times for %s, want 1", calls[inv.PaymentID], inv.PaymentID)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it set")
+	}
+
+	if got := spy.callCount(); got != 1 {
+		t.Errorf("spy.callCount() = %d, want 1", got)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+	var payload webhook.Payload
+	if err := json.Unmarshal(deliveries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal delivery payload: %v", err)
+	}
+	if payload.Event != "payment.confirmed" {
+		t.Errorf("payload.Event = %q, want %q", payload.Event, "payment.confirmed")
+	}
+}
+
+// TestReconcile_NoMatchingTransactionsLeavesInvoiceUntouched covers the "nothing to
+// reconcile" case: a non-terminal invoice whose getCompletedByPaymentID mock returns
+// no transactions at all must be left exactly as it was.
+func TestReconcile_NoMatchingTransactionsLeavesInvoiceUntouched(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-reconcile-untouched", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	getCompleted := func(paymentID string) ([]*tari_generated.TransactionInfo, error) {
+		return nil, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.Reconcile(ctx, getCompleted)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Reconcile() examined = %d, want 1", n)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want %q (untouched)", got.Status, invoice.StatusPending)
+	}
+
+	if got := spy.callCount(); got != 0 {
+		t.Errorf("spy.callCount() = %d, want 0", got)
+	}
+}
+
+// TestReconcile_AlreadyTerminalInvoiceIsNeverQueried proves ListNonTerminal's
+// filtering is actually doing its job inside Reconcile — not just that the
+// terminal-guard inside handleTransaction would have caught it anyway — by
+// confirming getCompletedByPaymentID is never even CALLED for an already-terminal
+// invoice.
+func TestReconcile_AlreadyTerminalInvoiceIsNeverQueried(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	terminal, err := invoiceStore.Create(ctx, "order-reconcile-terminal", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := invoiceStore.UpdateStatus(ctx, terminal.ID, invoice.StatusConfirmed, &now); err != nil {
+		t.Fatalf("UpdateStatus(terminal): %v", err)
+	}
+
+	nonTerminal, err := invoiceStore.Create(ctx, "order-reconcile-nonterminal", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	var calledFor []string
+	getCompleted := func(paymentID string) ([]*tari_generated.TransactionInfo, error) {
+		calledFor = append(calledFor, paymentID)
+		return nil, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.Reconcile(ctx, getCompleted)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Reconcile() examined = %d, want 1 (only the non-terminal invoice)", n)
+	}
+
+	for _, paymentID := range calledFor {
+		if paymentID == terminal.PaymentID {
+			t.Errorf("getCompletedByPaymentID was called for the already-terminal invoice's payment_id %q, want it never queried at all", terminal.PaymentID)
+		}
+	}
+	if len(calledFor) != 1 || calledFor[0] != nonTerminal.PaymentID {
+		t.Errorf("getCompletedByPaymentID calls = %v, want exactly [%q]", calledFor, nonTerminal.PaymentID)
+	}
+
+	// The terminal invoice must remain exactly as it was.
+	gotTerminal, err := invoiceStore.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID(terminal) error = %v", err)
+	}
+	if gotTerminal.Status != invoice.StatusConfirmed {
+		t.Errorf("terminal invoice Status = %q, want %q (untouched)", gotTerminal.Status, invoice.StatusConfirmed)
+	}
+}
+
+// TestReconcile_OutboundTransactionsAreIgnored confirms Reconcile's direction filter
+// (transactionInfoIsInbound) mirrors handleEvent's own: an outbound TransactionInfo
+// for a non-terminal invoice must not affect it at all.
+func TestReconcile_OutboundTransactionsAreIgnored(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-reconcile-outbound", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	getCompleted := func(paymentID string) ([]*tari_generated.TransactionInfo, error) {
+		return []*tari_generated.TransactionInfo{
+			outboundCompletedTxn(tari_generated.TransactionStatus_TRANSACTION_STATUS_MINED_CONFIRMED, 99, 1000),
+		}, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	if _, err := w.Reconcile(ctx, getCompleted); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want %q (outbound transaction must be ignored)", got.Status, invoice.StatusPending)
+	}
+	if got := spy.callCount(); got != 0 {
+		t.Errorf("spy.callCount() = %d, want 0", got)
 	}
 }
