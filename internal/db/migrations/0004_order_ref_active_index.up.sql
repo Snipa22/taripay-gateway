@@ -1,0 +1,26 @@
+-- 0004_order_ref_active_index: supports the idempotent-invoice-creation fix (task
+-- brief part 1, I5/AI-16) — invoice.Store.Create now calls GetActiveByOrderRef
+-- first to find any existing NON-TERMINAL invoice for the same order_ref before
+-- inserting a new row (so a lost-response retry from the cart plugin returns the
+-- same invoice/address instead of minting a second one for the same order). This
+-- partial index keeps that lookup fast without indexing terminal
+-- (confirmed/rejected/expired/cancelled) rows, which are expected to accumulate
+-- indefinitely and would otherwise bloat a non-partial index for no query benefit.
+--
+-- Deliberately NOT a UNIQUE index: a genuinely new order that happens to reuse an
+-- order_ref after the original invoice went terminal (e.g. a recycled WooCommerce
+-- order number) must still be able to create a new invoice — see
+-- internal/invoice.TerminalStatuses' doc comment and the task brief's explicit
+-- scoping ("no two NON-TERMINAL invoices share the same order_ref", not a global
+-- uniqueness constraint). Idempotency itself is enforced at the application layer
+-- (Store.Create's check-then-insert), not the database layer, per the task brief's
+-- "no new error type needed for the caller" instruction — this index is purely a
+-- performance aid for that check, not a correctness guarantee against concurrent
+-- duplicate requests (an unlikely race in this gateway's expected usage: a cart
+-- plugin retrying a lost response is not expected to fire two POST /invoice calls
+-- truly concurrently).
+--
+-- Status list mirrors internal/invoice.TerminalStatuses exactly — keep in sync if
+-- that var ever changes.
+CREATE INDEX idx_invoices_order_ref_active ON invoices (order_ref)
+    WHERE status NOT IN ('confirmed', 'rejected', 'expired', 'cancelled');
