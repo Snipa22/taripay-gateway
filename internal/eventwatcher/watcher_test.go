@@ -1021,3 +1021,48 @@ func TestRun_LatePaymentAfterExpiryDoesNotConfirm(t *testing.T) {
 		t.Errorf("len(deliveries) = %d, want 0", len(deliveries))
 	}
 }
+
+// ---- mapStatus tests (S5/AI-06 fix, task brief part 4) ----
+
+// TestMapStatus_CompletedMapsToSeenNotRejected covers the exact bug the review
+// flagged: a normal interactive payment's first status ("Completed", pre-broadcast)
+// must map to seen/payment.seen, NOT rejected/payment.rejected (the old default
+// branch's behavior, which fired a false payment.rejected webhook before the same
+// payment later correctly progressed).
+func TestMapStatus_CompletedMapsToSeenNotRejected(t *testing.T) {
+	gotStatus, gotEvent := mapStatus("Completed")
+	if gotStatus != invoice.StatusSeen {
+		t.Errorf("mapStatus(%q) status = %q, want %q", "Completed", gotStatus, invoice.StatusSeen)
+	}
+	if gotEvent != "payment.seen" {
+		t.Errorf("mapStatus(%q) event = %q, want %q", "Completed", gotEvent, "payment.seen")
+	}
+}
+
+// TestMapStatus_QueuedImportedCoinbaseMapToSeen covers the rest of the S5/AI-06
+// fix's explicit list of valid, in-progress/non-terminal statuses that must not fall
+// into the rejected default branch.
+func TestMapStatus_QueuedImportedCoinbaseMapToSeen(t *testing.T) {
+	for _, status := range []string{"Queued", "Imported", "Coinbase"} {
+		gotStatus, gotEvent := mapStatus(status)
+		if gotStatus != invoice.StatusSeen {
+			t.Errorf("mapStatus(%q) status = %q, want %q", status, gotStatus, invoice.StatusSeen)
+		}
+		if gotEvent != "payment.seen" {
+			t.Errorf("mapStatus(%q) event = %q, want %q", status, gotEvent, "payment.seen")
+		}
+	}
+}
+
+// TestMapStatus_RejectedStillMapsToRejected confirms the narrowed default branch
+// still correctly treats a genuine rejection as rejected — the S5/AI-06 fix narrows
+// the default branch's scope, it does not remove rejected-handling entirely.
+func TestMapStatus_RejectedStillMapsToRejected(t *testing.T) {
+	gotStatus, gotEvent := mapStatus("Rejected")
+	if gotStatus != invoice.StatusRejected {
+		t.Errorf("mapStatus(%q) status = %q, want %q", "Rejected", gotStatus, invoice.StatusRejected)
+	}
+	if gotEvent != "payment.rejected" {
+		t.Errorf("mapStatus(%q) event = %q, want %q", "Rejected", gotEvent, "payment.rejected")
+	}
+}
