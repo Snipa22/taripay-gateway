@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # internal/db, internal/invoice, and internal/webhook all require a live
+    # Postgres to run their full suite (see internal/db/migrations_test.go and
+    # internal/invoice/invoice_test.go, which read TARIPAY_TEST_POSTGRES_DSN and
+    # t.Skip() when it's unset) — this repo differs from this org's other Go
+    # services in that respect, hence the services: block below where sibling
+    # repos have none.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: taripay
+          POSTGRES_PASSWORD: taripay
+          POSTGRES_DB: taripay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TARIPAY_TEST_POSTGRES_DSN: postgres://taripay:taripay@localhost:5432/taripay_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13
+
+      # -p 1: Phase 1b's own test files already require sequential (non-parallel)
+      # package execution against the shared live schema above; see AGENTS.md /
+      # Phase 1a-1b PR descriptions for the full "why" — parallel packages racing
+      # against one Postgres instance/schema is not safe here.
+      - name: Test
+        id: test
+        run: go test -p 1 -count=1 -race -v ./...
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.test.outcome }}" = "success" ]; then
+            echo "### :white_check_mark: CI passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### :x: CI failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
