@@ -45,6 +45,18 @@ const (
 // webhook.DefaultRetryMaxAge/DefaultRetryMaxAttempts.
 const webhookRetryTickerInterval = 60 * time.Second
 
+// ttlSweepTickerInterval is how often runTTLSweepLoop below calls
+// invoice.Store.ExpireStale (task brief part 2, item 1 — TTL enforcement). 60s is a
+// PLACEHOLDER, UNCONFIRMED value, same "reasonable-sounding guess, not
+// project-owner-approved" caveat as webhookRetryTickerInterval above and
+// config.DefaultInvoiceTTLMinutes: the invoice TTL itself is measured in minutes, so
+// a 60s sweep interval means an expired invoice is caught within, at worst, roughly
+// one sweep interval of its expires_at passing — the confirm-time check added
+// alongside this sweep (see internal/eventwatcher's handleTransaction) closes the
+// race this interval alone can't (a payment landing in the exact window between
+// expires_at passing and the next sweep tick).
+const ttlSweepTickerInterval = 60 * time.Second
+
 func main() {
 	configFile := flag.String("config", "", "Path to a TOML config file (env: TARIPAY_CONFIG_FILE)")
 	walletGRPCAddr := flag.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
@@ -136,6 +148,14 @@ func main() {
 
 	watcher := eventwatcher.NewWatcher(invoiceStore, webhookStore, sender, cfg.WebhookCallbackURL, walletGRPC.StreamTransactionEvents)
 	go runEventWatcherWithBackoff(ctx, watcher, walletGRPC.GetCompletedTransactionsByPaymentID)
+
+	// TTL enforcement's periodic sweep half (task brief part 2, item 1) — the
+	// other half, the confirm-time check, lives in
+	// internal/eventwatcher.handleTransaction (shared by both the live stream and
+	// Reconcile). Started alongside the event-watcher supervisor loop above,
+	// stopped cleanly on the same shutdown ctx — same shape as
+	// runWebhookRetryLoop below.
+	go runTTLSweepLoop(ctx, invoiceStore, ttlSweepTickerInterval)
 
 	// Automatic background retry loop for failed/stuck webhook deliveries (task
 	// brief part 2, item 2). Started alongside the event-watcher supervisor loop
@@ -283,6 +303,41 @@ func runWebhookRetryLoop(ctx context.Context, webhookStore *webhook.Store, sende
 			}
 			if count > 0 {
 				log.Printf("gateway: webhook retry loop: retried %d delivery(ies)", count)
+			}
+		}
+	}
+}
+
+// runTTLSweepLoop is the periodic half of TTL enforcement (task brief part 2, item
+// 1): every interval, it calls invoice.Store.ExpireStale once (moving any
+// pending/seen invoice whose expires_at has passed to StatusExpired), logs the
+// outcome, and repeats, until ctx is cancelled. Same shape as runWebhookRetryLoop
+// above (ticker, select on ctx.Done()/ticker.C) — checking ctx.Done() in the select
+// (rather than only ever waiting on the ticker) means a context that's already
+// cancelled by the time this runs returns promptly without waiting for a full tick
+// interval first.
+//
+// This is only HALF of TTL enforcement — the other half, the confirm-time check
+// that closes the race this sweep alone can still lose (a payment landing in the
+// exact window between an invoice's expires_at passing and the next sweep tick),
+// lives in internal/eventwatcher.handleTransaction, shared by both the live event
+// stream and Reconcile.
+func runTTLSweepLoop(ctx context.Context, invoiceStore *invoice.Store, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count, err := invoiceStore.ExpireStale(ctx)
+			if err != nil {
+				log.Printf("gateway: ttl sweep loop: %v", err)
+				continue
+			}
+			if count > 0 {
+				log.Printf("gateway: ttl sweep loop: expired %d invoice(s)", count)
 			}
 		}
 	}
