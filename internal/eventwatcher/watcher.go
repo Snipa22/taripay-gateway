@@ -197,9 +197,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
-// handleEvent processes a single transaction event: correlates it to an invoice by
-// payment ID, maps its status, and — only on an actual status transition — updates
-// the invoice and fires a webhook.
+// handleEvent processes a single live-stream transaction event: filters to inbound
+// events, then normalizes it down to handleTransaction's plain
+// (paymentID, txID, status, amount) shape and calls that shared core logic. This
+// function's own body is now ONLY the TransactionEventResponse-specific adapter
+// step — see handleTransaction's doc comment for why the actual status-mapping/
+// amount-check/terminal-guard/webhook decision logic lives there instead, shared
+// with a future reconciliation path that will feed it historical transactions
+// instead of live stream events.
 func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.TransactionEventResponse) {
 	if ev == nil || ev.Transaction == nil {
 		log.Printf("eventwatcher: received event with nil Transaction, skipping")
@@ -224,12 +229,29 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 	}
 
 	paymentID := string(txn.UserPaymentId)
+	w.handleTransaction(ctx, paymentID, txn.TxId, txn.Status, txn.Amount)
+}
+
+// handleTransaction is the shared core "given a payment_id-correlated status +
+// amount, decide the new invoice state and possibly fire a webhook" logic —
+// factored out of what used to be handleEvent's entire body (task brief part 1's
+// prerequisite refactor) so there is exactly ONE implementation of this decision.
+// handleEvent above is now just the TransactionEventResponse-specific adapter that
+// calls this; a follow-up commit adds a reconciliation path that adapts
+// *tari_generated.TransactionInfo (from GetCompletedTransactionsByPaymentID) into
+// this same shape and calls this same function, so that path duplicates none of
+// this logic either.
+//
+// status must already be in the same short, space/hyphen-separated wire form
+// mapStatus expects (mapStatus itself is unchanged by this refactor — see that
+// function's doc comment).
+func (w *Watcher) handleTransaction(ctx context.Context, paymentID, txID, status string, amount uint64) {
 	inv, err := w.invoiceStore.GetByPaymentID(ctx, paymentID)
 	if err != nil {
 		if errors.Is(err, invoice.ErrNotFound) {
-			// Could be an event for an invoice created before this gateway
-			// started, or unrelated wallet activity — not an error.
-			log.Printf("eventwatcher: no invoice found for payment_id %q, skipping (tx_id=%s)", paymentID, txn.TxId)
+			// Could be an event/transaction for an invoice created before this
+			// gateway started, or unrelated wallet activity — not an error.
+			log.Printf("eventwatcher: no invoice found for payment_id %q, skipping (tx_id=%s)", paymentID, txID)
 			return
 		}
 		// A transient DB error on lookup: log and skip this event rather than
@@ -242,7 +264,7 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 		return
 	}
 
-	mappedStatus, webhookEvent := mapStatus(txn.Status)
+	mappedStatus, webhookEvent := mapStatus(status)
 	previousStatus := inv.Status
 
 	// Terminal-state guard (task brief part 1, S2/AI-05 fix): once an invoice has
@@ -255,7 +277,7 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 	// total. This is not an error: reorgs and duplicate/stray events are expected
 	// wallet behavior, not a bug in this gateway.
 	if isTerminalStatus(previousStatus) {
-		log.Printf("eventwatcher: invoice %s already in terminal status %q, ignoring post-terminal event (tx_id=%s, computed_status=%q)", inv.ID, previousStatus, txn.TxId, mappedStatus)
+		log.Printf("eventwatcher: invoice %s already in terminal status %q, ignoring post-terminal event (tx_id=%s, computed_status=%q)", inv.ID, previousStatus, txID, mappedStatus)
 		return
 	}
 
@@ -283,10 +305,10 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 		//
 		// AddReceivedAmount does an atomic accumulate-and-return rather than a
 		// read-then-write, so the invoice's running total (not just this one
-		// event's txn.Amount in isolation) is what's compared below — this is
+		// event's amount in isolation) is what's compared below — this is
 		// what lets a second, top-up transfer for the same invoice eventually
 		// push it from underpaid to confirmed.
-		total, err := w.invoiceStore.AddReceivedAmount(ctx, inv.ID, txn.Amount)
+		total, err := w.invoiceStore.AddReceivedAmount(ctx, inv.ID, amount)
 		if err != nil {
 			log.Printf("eventwatcher: add received amount for invoice %s: %v", inv.ID, err)
 			return
@@ -316,16 +338,21 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 		return
 	}
 
-	w.fireWebhook(ctx, inv, newStatus, webhookEvent, txn, confirmedAt, amountReceived)
+	w.fireWebhook(ctx, inv, newStatus, webhookEvent, txID, confirmedAt, amountReceived)
 }
 
 // fireWebhook handles an actual status transition (previousStatus != newStatus,
-// already established by handleEvent): if no webhook callback URL is configured, it
-// just performs the plain invoice.Store.UpdateStatus (no delivery row is needed at
-// all in that case — see NewWatcher's doc comment). Otherwise it atomically commits
-// the status update together with a new pending delivery row (task brief part 2,
-// item 1 — see updateStatusAndCreateDelivery), then attempts delivery.
-func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent string, txn *tari_generated.TransactionEvent, confirmedAt *time.Time, amountReceived uint64) {
+// already established by handleTransaction): if no webhook callback URL is
+// configured, it just performs the plain invoice.Store.UpdateStatus (no delivery row
+// is needed at all in that case — see NewWatcher's doc comment). Otherwise it
+// atomically commits the status update together with a new pending delivery row
+// (task brief part 2, item 1 — see updateStatusAndCreateDelivery), then attempts
+// delivery. txID is the correlated transaction's ID as a string — TransactionEvent's
+// TxId is already a string; a future reconciliation path adapting
+// *tari_generated.TransactionInfo (whose TxId is a uint64) will format it to a
+// string before reaching handleTransaction/fireWebhook, so this function itself
+// needs no knowledge of which wallet-gRPC shape a given call originated from.
+func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent, txID string, confirmedAt *time.Time, amountReceived uint64) {
 	if w.callbackURL == "" {
 		log.Printf("eventwatcher: webhook callback URL not configured, skipping webhook for invoice %s (event=%s)", inv.ID, webhookEvent)
 		if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
@@ -341,7 +368,7 @@ func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStat
 		Status:              newStatus,
 		AmountUTari:         inv.AmountUTari,
 		AmountReceivedUTari: amountReceived,
-		TxID:                txn.TxId,
+		TxID:                txID,
 		Event:               webhookEvent,
 	}
 	if confirmedAt != nil {
