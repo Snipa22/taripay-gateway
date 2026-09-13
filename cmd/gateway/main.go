@@ -135,7 +135,7 @@ func main() {
 	sender := webhook.NewSender(cfg.WebhookHMACSecret)
 
 	watcher := eventwatcher.NewWatcher(invoiceStore, webhookStore, sender, cfg.WebhookCallbackURL, walletGRPC.StreamTransactionEvents)
-	go runEventWatcherWithBackoff(ctx, watcher)
+	go runEventWatcherWithBackoff(ctx, watcher, walletGRPC.GetCompletedTransactionsByPaymentID)
 
 	// Automatic background retry loop for failed/stuck webhook deliveries (task
 	// brief part 2, item 2). Started alongside the event-watcher supervisor loop
@@ -195,9 +195,37 @@ func registerAdminRoutes(mux *http.ServeMux, adminServer *admin.Server, authToke
 // complexity here, since a wallet gRPC connection dropping repeatedly in a tight loop
 // is itself a signal worth surfacing loudly via the resulting log spam, not silently
 // smoothing over.
-func runEventWatcherWithBackoff(ctx context.Context, watcher *eventwatcher.Watcher) {
+//
+// Also runs watcher.Reconcile (the reconciliation-after-downtime fix, task brief
+// part 1, S2/I7) before every attempt to (re)open the live stream below — both the
+// very first attempt (gateway startup) and every restart-with-backoff reconnect
+// after a stream error, since that reconnect window is exactly the downtime this
+// closes. Reconcile runs SYNCHRONOUSLY here (blocking, before watcher.Run is
+// called) rather than concurrently with the live stream — a deliberate
+// simplification over the task brief's "your call" allowance for a concurrent
+// variant: running it synchronously avoids the double-count/race concern entirely
+// (no live event and no reconciled historical transaction can ever be "in flight"
+// for the same invoice at the same time), rather than relying on the
+// already-merged AddReceivedAmount atomic-accumulate fix to merely make such a race
+// harmless. Reconciling a handful of non-terminal invoices via one gRPC call each
+// is expected to be fast relative to how rarely this runs (gateway startup, and
+// stream-error reconnects), so the added latency before the live stream (re)opens
+// is not a practical concern.
+func runEventWatcherWithBackoff(ctx context.Context, watcher *eventwatcher.Watcher, getCompletedByPaymentID eventwatcher.GetCompletedByPaymentIDFunc) {
 	backoff := eventWatcherInitialBackoff
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if n, err := watcher.Reconcile(ctx, getCompletedByPaymentID); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("gateway: eventwatcher: reconcile: %v", err)
+		} else {
+			log.Printf("gateway: eventwatcher: reconcile: examined %d non-terminal invoice(s)", n)
+		}
 		if ctx.Err() != nil {
 			return
 		}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,8 +204,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 // function's own body is now ONLY the TransactionEventResponse-specific adapter
 // step — see handleTransaction's doc comment for why the actual status-mapping/
 // amount-check/terminal-guard/webhook decision logic lives there instead, shared
-// with a future reconciliation path that will feed it historical transactions
-// instead of live stream events.
+// with Reconcile's historical-transaction path.
 func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.TransactionEventResponse) {
 	if ev == nil || ev.Transaction == nil {
 		log.Printf("eventwatcher: received event with nil Transaction, skipping")
@@ -235,12 +235,11 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 // handleTransaction is the shared core "given a payment_id-correlated status +
 // amount, decide the new invoice state and possibly fire a webhook" logic —
 // factored out of what used to be handleEvent's entire body (task brief part 1's
-// prerequisite refactor) so there is exactly ONE implementation of this decision.
-// handleEvent above is now just the TransactionEventResponse-specific adapter that
-// calls this; a follow-up commit adds a reconciliation path that adapts
-// *tari_generated.TransactionInfo (from GetCompletedTransactionsByPaymentID) into
-// this same shape and calls this same function, so that path duplicates none of
-// this logic either.
+// prerequisite refactor) so there is exactly ONE implementation of this decision,
+// called from two places: the live event-stream path (handleEvent above, adapting a
+// *tari_generated.TransactionEvent) and the reconciliation path (Reconcile below,
+// adapting a *tari_generated.TransactionInfo). Neither caller duplicates any of this
+// logic — see Reconcile's doc comment for its own adapter step.
 //
 // status must already be in the same short, space/hyphen-separated wire form
 // mapStatus expects (mapStatus itself is unchanged by this refactor — see that
@@ -348,10 +347,9 @@ func (w *Watcher) handleTransaction(ctx context.Context, paymentID, txID, status
 // atomically commits the status update together with a new pending delivery row
 // (task brief part 2, item 1 — see updateStatusAndCreateDelivery), then attempts
 // delivery. txID is the correlated transaction's ID as a string — TransactionEvent's
-// TxId is already a string; a future reconciliation path adapting
-// *tari_generated.TransactionInfo (whose TxId is a uint64) will format it to a
-// string before reaching handleTransaction/fireWebhook, so this function itself
-// needs no knowledge of which wallet-gRPC shape a given call originated from.
+// TxId is already a string; TransactionInfo's TxId is a uint64 that Reconcile's
+// adapter step formats to a string before reaching handleTransaction/fireWebhook, so
+// this function itself needs no knowledge of which wallet-gRPC shape it came from.
 func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent, txID string, confirmedAt *time.Time, amountReceived uint64) {
 	if w.callbackURL == "" {
 		log.Printf("eventwatcher: webhook callback URL not configured, skipping webhook for invoice %s (event=%s)", inv.ID, webhookEvent)
@@ -446,4 +444,162 @@ func (w *Watcher) updateStatusAndCreateDelivery(ctx context.Context, invoiceID u
 	}
 
 	return delivery, nil
+}
+
+// GetCompletedByPaymentIDFunc matches walletGRPC.GetCompletedTransactionsByPaymentID's
+// exact signature — confirmed directly against the real go-tari-lib@def118969dbc
+// dependency this repo pins (see that function's own doc comment in
+// go-tari-lib/walletGRPC/wallet.go). Tests inject a fake instead of the real
+// function, same DI pattern as EventSourceFunc above, so they never touch a real
+// wallet gRPC connection.
+type GetCompletedByPaymentIDFunc func(paymentID string) ([]*tari_generated.TransactionInfo, error)
+
+// Reconcile is the reconciliation-after-downtime fix (task brief part 1, S2/I7): the
+// live event-stream (Run/handleEvent above) only ever sees transaction events that
+// are emitted WHILE it is connected — any payment that lands during a deploy, a
+// crash-restart, or the restart-with-backoff window in cmd/gateway's
+// runEventWatcherWithBackoff is missed forever unless something else catches it up
+// afterwards. Reconcile is that catch-up: for every invoice this gateway still
+// considers non-terminal (invoice.Store.ListNonTerminal — pending, seen, underpaid),
+// it calls getCompletedByPaymentID with that invoice's PaymentID, and for every
+// returned TransactionInfo, applies the exact same status-mapping/amount-check/
+// terminal-guard/webhook decision handleEvent's live-stream path uses — via the
+// shared handleTransaction helper, so neither path duplicates that logic (see
+// handleTransaction's doc comment).
+//
+// TransactionInfo's Direction/Status fields use the long enum-name wire form
+// (unlike TransactionEvent's short string form — see
+// transactionEventDirectionInbound's doc comment for the full, live-confirmed
+// explanation of why these two structs differ), and TxId is a uint64 rather than a
+// string, so this function is also where that adaptation happens: transactionInfoIsInbound
+// checks Direction, transactionInfoStatusText normalizes Status down to the same
+// short form mapStatus expects, and strconv.FormatUint converts TxId to a string —
+// all so handleTransaction itself never needs to know which wallet-gRPC shape a
+// given call originated from.
+//
+// Returns the number of non-terminal invoices actually examined (regardless of
+// whether any of them turned out to have a matching completed transaction) — the
+// task brief's (int, error) return shape doesn't pin down exactly what the int
+// means, so this is the definition chosen and documented here. A non-nil error is
+// only returned for an infra-level failure listing non-terminal invoices in the
+// first place (ListNonTerminal); a per-invoice getCompletedByPaymentID failure is
+// logged and that invoice is skipped (not fatal to the rest of the pass) — same
+// "log and keep going" precedent handleTransaction itself uses for a transient
+// invoice-lookup failure.
+//
+// KNOWN LIMITATION, flagged rather than silently worked around (per AGENTS.md's
+// "don't silently pick... without citing it clearly" rule): getCompletedByPaymentID
+// returns EVERY known transaction for a payment ID, not just ones not yet seen by
+// this gateway — there is no tx_id-level dedup here or in AddReceivedAmount. For the
+// common case this fix targets (an invoice that missed its ONE confirming
+// transaction entirely while this gateway was down) that's exactly right: the first
+// Reconcile pass after restart applies it once, the invoice becomes terminal
+// (confirmed/underpaid-then-later-confirmed), and no further Reconcile pass ever
+// re-examines it. But an invoice that stays non-terminal (StatusUnderpaid) across
+// MULTIPLE restarts would have its already-counted historical transaction(s)
+// re-applied on each subsequent Reconcile pass, double-counting AmountReceivedUTari.
+// Closing that fully would need a tx_id-level idempotency table (a real schema
+// addition), which is out of scope for this pass — flagged here for the project
+// owner (Alex) rather than treated as solved.
+func (w *Watcher) Reconcile(ctx context.Context, getCompletedByPaymentID GetCompletedByPaymentIDFunc) (int, error) {
+	invoices, err := w.invoiceStore.ListNonTerminal(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("eventwatcher: reconcile: list non-terminal invoices: %w", err)
+	}
+
+	examined := 0
+	for _, inv := range invoices {
+		if ctx.Err() != nil {
+			return examined, ctx.Err()
+		}
+		examined++
+
+		txns, err := getCompletedByPaymentID(inv.PaymentID)
+		if err != nil {
+			log.Printf("eventwatcher: reconcile: get completed transactions for payment_id %q (invoice %s): %v (skipping)", inv.PaymentID, inv.ID, err)
+			continue
+		}
+
+		for _, txn := range txns {
+			if txn == nil {
+				continue
+			}
+			if !transactionInfoIsInbound(txn) {
+				// Outbound (this wallet's own sends) — not relevant to invoice
+				// tracking, same treatment as handleEvent's own direction
+				// filter above.
+				continue
+			}
+			txID := strconv.FormatUint(txn.TxId, 10)
+			status := transactionInfoStatusText(txn.Status)
+			w.handleTransaction(ctx, inv.PaymentID, txID, status, txn.Amount)
+		}
+	}
+	return examined, nil
+}
+
+// transactionInfoIsInbound reports whether txn represents an inbound payment, per
+// TransactionInfo.Direction's real proto enum (as opposed to
+// TransactionEvent.Direction's plain string field — see
+// transactionEventDirectionInbound's doc comment for the full format-difference
+// rationale this mirrors).
+func transactionInfoIsInbound(txn *tari_generated.TransactionInfo) bool {
+	return txn.Direction == tari_generated.TransactionDirection_TRANSACTION_DIRECTION_INBOUND
+}
+
+// transactionInfoStatusText converts a TransactionInfo.Status enum value into the
+// same short, space/hyphen-separated status text form mapStatus expects (mirroring
+// TransactionEvent.Status's wire format) — see transactionEventDirectionInbound's
+// doc comment for the full TransactionInfo-vs-TransactionEvent format-difference
+// rationale this mirrors for Status too. TransactionInfo.Status is a real proto enum
+// (unlike TransactionEvent.Status's plain string field), and its own .String() form
+// is the long TRANSACTION_STATUS_* enum-name form (e.g.
+// "TRANSACTION_STATUS_MINED_CONFIRMED"), which mapStatus's Contains-based matching
+// does NOT understand as-is: the enum-name form uses underscores throughout (no
+// hyphens at all), so a naive underscore-to-space substitution would turn
+// "TRANSACTION_STATUS_ONE_SIDED_CONFIRMED" into "ONE SIDED CONFIRMED" — missing the
+// hyphen mapStatus's "ONE-SIDED CONFIRMED" case actually requires. Rather than teach
+// mapStatus two incompatible wire formats, this small, explicit adapter table
+// converts every known TransactionStatus value to the exact short form its
+// TransactionEvent.Status counterpart would use for the equivalent chain state, so
+// mapStatus itself needs no changes to serve both callers.
+func transactionInfoStatusText(status tari_generated.TransactionStatus) string {
+	switch status {
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_COMPLETED:
+		return "Completed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_BROADCAST:
+		return "Broadcast"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_MINED_UNCONFIRMED:
+		return "Mined Unconfirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_IMPORTED:
+		return "Imported"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_PENDING:
+		return "Pending"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_COINBASE:
+		return "Coinbase"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_MINED_CONFIRMED:
+		return "Mined Confirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_REJECTED:
+		return "Rejected"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_ONE_SIDED_UNCONFIRMED:
+		return "One-Sided Unconfirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_ONE_SIDED_CONFIRMED:
+		return "One-Sided Confirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_QUEUED:
+		return "Queued"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_NOT_FOUND:
+		return "Not Found"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_COINBASE_UNCONFIRMED:
+		return "Coinbase Unconfirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_COINBASE_CONFIRMED:
+		return "Coinbase Confirmed"
+	case tari_generated.TransactionStatus_TRANSACTION_STATUS_COINBASE_NOT_IN_BLOCK_CHAIN:
+		return "Coinbase Not In Block Chain"
+	default:
+		// Genuinely unrecognized enum value (e.g. a future wallet.proto addition
+		// this gateway doesn't know about yet) — fall back to the enum's own
+		// String() form. mapStatus's default branch will treat this as
+		// rejection-shaped, same as any other unrecognized status string.
+		return status.String()
+	}
 }

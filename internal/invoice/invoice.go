@@ -15,6 +15,12 @@
 // AddReceivedAmount method, so internal/eventwatcher can compare the amount actually
 // received against the invoiced amount before confirming an invoice instead of
 // trusting the chain-level status alone.
+//
+// The 2026-09-13 reconciliation-and-TTL-enforcement fix adds one more: the
+// ListNonTerminal method, so internal/eventwatcher's startup/reconnect
+// reconciliation sweep (task brief part 1, S2/I7) has exactly the set of invoices
+// that could still need a status transition from wallet state missed during
+// downtime.
 package invoice
 
 import (
@@ -329,6 +335,47 @@ func (s *Store) List(ctx context.Context, status string, limit int) ([]*Invoice,
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("invoice: list: rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListNonTerminal returns every invoice whose current status is NOT one of
+// TerminalStatuses. Added for the reconciliation-after-downtime fix (task brief part
+// 1, S2/I7): internal/eventwatcher's Reconcile calls this on event-watcher
+// startup/reconnect to find exactly the invoices that could still possibly need a
+// status transition from wallet state this gateway missed while the live event
+// stream wasn't running (a deploy, crash-restart, or a backoff window). Reuses
+// TerminalStatuses — this package's existing single source of truth for "which
+// statuses are terminal" — rather than hand-writing a second "which statuses count
+// as non-terminal" list elsewhere in the codebase, per the task brief's explicit
+// instruction.
+func (s *Store) ListNonTerminal(ctx context.Context) ([]*Invoice, error) {
+	terminal := make([]string, 0, len(TerminalStatuses))
+	for status := range TerminalStatuses {
+		terminal = append(terminal, status)
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		FROM invoices
+		WHERE status != ALL($1)
+		ORDER BY created_at ASC
+	`, terminal)
+	if err != nil {
+		return nil, fmt.Errorf("invoice: list non-terminal: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Invoice
+	for rows.Next() {
+		inv, err := scanInvoice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("invoice: list non-terminal: rows: %w", err)
 	}
 	return out, nil
 }
