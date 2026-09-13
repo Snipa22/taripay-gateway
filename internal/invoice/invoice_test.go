@@ -175,6 +175,55 @@ func TestUpdateStatus(t *testing.T) {
 	}
 }
 
+// TestAddReceivedAmount covers the C2-fix addition (task brief "fix C2 and add
+// auth", part 1): AddReceivedAmount must accumulate correctly across multiple calls
+// (simulating multiple transaction events for the same invoice) and return the new
+// running total each time, against real Postgres — verifying the atomic
+// UPDATE ... RETURNING form actually persists and reflects accumulation, not just a
+// mocked/in-memory counter.
+func TestAddReceivedAmount(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	inv, err := s.Create(ctx, "order-received", 5000, time.Hour)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if inv.AmountReceivedUTari != 0 {
+		t.Errorf("AmountReceivedUTari on creation = %d, want 0", inv.AmountReceivedUTari)
+	}
+
+	total, err := s.AddReceivedAmount(ctx, inv.ID, 3000)
+	if err != nil {
+		t.Fatalf("AddReceivedAmount(3000) error = %v", err)
+	}
+	if total != 3000 {
+		t.Errorf("AddReceivedAmount(3000) returned total = %d, want 3000", total)
+	}
+
+	total, err = s.AddReceivedAmount(ctx, inv.ID, 2500)
+	if err != nil {
+		t.Fatalf("AddReceivedAmount(2500) error = %v", err)
+	}
+	if total != 5500 {
+		t.Errorf("AddReceivedAmount(2500) returned total = %d, want 5500 (cumulative)", total)
+	}
+
+	// Round-trip through the DB confirms the accumulated total was actually
+	// persisted, not just returned in-memory.
+	got, err := s.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.AmountReceivedUTari != 5500 {
+		t.Errorf("GetByID().AmountReceivedUTari = %d, want 5500", got.AmountReceivedUTari)
+	}
+
+	if _, err := s.AddReceivedAmount(ctx, uuid.New(), 100); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AddReceivedAmount(unknown id) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestExpireStale(t *testing.T) {
 	s := setupStore(t, nil)
 	ctx := context.Background()

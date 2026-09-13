@@ -54,8 +54,8 @@ type Delivery struct {
 // Payload is the JSON body shape POSTed to a merchant's webhook callback URL, per the
 // task brief's "Webhook payload JSON shape" spec. Event distinguishes what triggered
 // this particular delivery (e.g. "payment.seen", "payment.confirmed",
-// "payment.rejected") since a merchant may receive multiple webhooks for one invoice
-// as it transitions between statuses.
+// "payment.rejected", "payment.underpaid") since a merchant may receive multiple
+// webhooks for one invoice as it transitions between statuses.
 type Payload struct {
 	InvoiceID   string `json:"invoice_id"`
 	PaymentID   string `json:"payment_id"`
@@ -65,6 +65,16 @@ type Payload struct {
 	TxID        string `json:"tx_id"`
 	ConfirmedAt string `json:"confirmed_at,omitempty"`
 	Event       string `json:"event"`
+
+	// AmountReceivedUTari is a C2-fix addition (task brief "fix C2 and add
+	// auth", part 1): the cumulative amount actually received so far for this
+	// invoice (invoice.Invoice.AmountReceivedUTari at the time this webhook
+	// fired), alongside AmountUTari above which remains the *invoiced* amount.
+	// Only meaningfully populated for "payment.underpaid" (and any subsequent
+	// "payment.confirmed" that followed an underpayment) — it lets the
+	// merchant's plugin show both numbers (invoiced vs. received) rather than
+	// just "something went wrong".
+	AmountReceivedUTari uint64 `json:"amount_received_utari,omitempty"`
 }
 
 // Store wraps a *pgxpool.Pool with this package's webhook-delivery persistence
