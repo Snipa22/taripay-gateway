@@ -39,7 +39,7 @@ func setupTestServer(t *testing.T, resolveErr error) *httptest.Server {
 	t.Cleanup(pool.Close)
 
 	database := &db.DB{Pool: pool}
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, invoices CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
 		t.Fatalf("cleanup before test: %v", err)
 	}
 	if err := database.Migrate(ctx); err != nil {

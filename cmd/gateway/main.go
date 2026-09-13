@@ -1,9 +1,6 @@
-// Command gateway is TariPay Gateway's core HTTP bootstrap for Phase 1a: invoice
-// creation, wallet address resolution, and Postgres persistence.
-//
-// Phase 1b (a separate, later dispatch) adds the event-watcher/webhook delivery loop
-// and the HTMX admin UI on top of what this binary starts up — neither exists yet, by
-// design (see AGENTS.md / the task brief's explicit scope constraints).
+// Command gateway is TariPay Gateway's HTTP bootstrap: invoice creation, wallet
+// address resolution, Postgres persistence (Phase 1a), plus Phase 1b's event-watcher/
+// webhook delivery loop and HTMX admin UI, all wired up here.
 package main
 
 import (
@@ -23,9 +20,22 @@ import (
 
 	"github.com/Snipa22/go-tari-lib/walletGRPC"
 
+	"github.com/Snipa22/taripay-gateway/internal/admin"
 	"github.com/Snipa22/taripay-gateway/internal/config"
 	"github.com/Snipa22/taripay-gateway/internal/db"
+	"github.com/Snipa22/taripay-gateway/internal/eventwatcher"
 	"github.com/Snipa22/taripay-gateway/internal/invoice"
+	"github.com/Snipa22/taripay-gateway/internal/webhook"
+)
+
+// eventWatcherInitialBackoff/eventWatcherMaxBackoff bound the restart-with-backoff
+// loop around Watcher.Run below: on a stream error, wait, then retry, doubling the
+// wait each time up to the cap. 30s is a PLACEHOLDER, UNCONFIRMED max — same
+// "reasonable-sounding guess, not project-owner-approved" caveat as
+// config.DefaultConfirmationDepth/DefaultInvoiceTTLMinutes.
+const (
+	eventWatcherInitialBackoff = 1 * time.Second
+	eventWatcherMaxBackoff     = 30 * time.Second
 )
 
 func main() {
@@ -33,19 +43,34 @@ func main() {
 	walletGRPCAddr := flag.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
 	postgresDSN := flag.String("postgres-dsn", "", "Postgres connection string (env: TARIPAY_POSTGRES_DSN; required, no default)")
 	httpAddr := flag.String("http-addr", "", "HTTP listen address (env: TARIPAY_HTTP_LISTEN_ADDR; default: "+config.DefaultHTTPListenAddr+")")
+	webhookCallbackURL := flag.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
+	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default, webhook delivery disabled if unset)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	cfg, err := config.Load(config.Flags{
-		ConfigFile:        *configFile,
-		WalletGRPCAddress: *walletGRPCAddr,
-		PostgresDSN:       *postgresDSN,
-		HTTPListenAddr:    *httpAddr,
+		ConfigFile:         *configFile,
+		WalletGRPCAddress:  *walletGRPCAddr,
+		PostgresDSN:        *postgresDSN,
+		HTTPListenAddr:     *httpAddr,
+		WebhookCallbackURL: *webhookCallbackURL,
+		WebhookHMACSecret:  *webhookHMACSecret,
 	})
 	if err != nil {
 		log.Fatalf("gateway: %v", err)
+	}
+
+	// Per the task brief: an unset webhook callback URL/HMAC secret is NOT fatal —
+	// invoice creation/lookup must keep working standalone — but it IS worth a
+	// loud warning, since it silently means every invoice-status transition's
+	// webhook delivery will be skipped (see internal/eventwatcher.fireWebhook).
+	if cfg.WebhookCallbackURL == "" {
+		log.Printf("gateway: WARNING: no webhook callback URL configured (TARIPAY_WEBHOOK_CALLBACK_URL) — webhook delivery is disabled")
+	}
+	if cfg.WebhookHMACSecret == "" {
+		log.Printf("gateway: WARNING: no webhook HMAC secret configured (TARIPAY_WEBHOOK_HMAC_SECRET) — outgoing webhooks (if any) will be signed with an empty secret")
 	}
 
 	// InitWalletGRPC establishes the wallet gRPC connection go-tari-lib's walletGRPC
@@ -82,9 +107,20 @@ func main() {
 		return resp.GetInteractiveAddressBase58(), nil
 	}
 
-	store := invoice.NewStore(database.Pool, resolveAddress)
+	invoiceStore := invoice.NewStore(database.Pool, resolveAddress)
+	webhookStore := webhook.NewStore(database.Pool)
+	sender := webhook.NewSender(cfg.WebhookHMACSecret)
 
-	handler := newHandler(store, time.Duration(cfg.InvoiceTTLMinutes)*time.Minute)
+	watcher := eventwatcher.NewWatcher(invoiceStore, webhookStore, sender, cfg.WebhookCallbackURL, walletGRPC.StreamTransactionEvents)
+	go runEventWatcherWithBackoff(ctx, watcher)
+
+	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances)
+	if err != nil {
+		log.Fatalf("gateway: admin: %v", err)
+	}
+
+	handler := newHandler(invoiceStore, time.Duration(cfg.InvoiceTTLMinutes)*time.Minute)
+	adminServer.RegisterRoutes(handler)
 
 	log.Printf("gateway: listening on %s (wallet grpc: %s)", cfg.HTTPListenAddr, cfg.WalletGRPCAddress)
 	httpServer := &http.Server{
@@ -103,6 +139,44 @@ func main() {
 		log.Fatalf("gateway: %v", err)
 	}
 	log.Printf("gateway: shutting down")
+}
+
+// runEventWatcherWithBackoff supervises watcher.Run with restart-with-backoff on
+// error: Run's own doc comment explicitly delegates this responsibility to its
+// caller. Backoff resets to eventWatcherInitialBackoff after every restart attempt
+// (whether or not it succeeds) — simplest possible policy for v1; a smarter one (only
+// resetting after a sustained period of successful running) is not worth the
+// complexity here, since a wallet gRPC connection dropping repeatedly in a tight loop
+// is itself a signal worth surfacing loudly via the resulting log spam, not silently
+// smoothing over.
+func runEventWatcherWithBackoff(ctx context.Context, watcher *eventwatcher.Watcher) {
+	backoff := eventWatcherInitialBackoff
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		err := watcher.Run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("gateway: eventwatcher: %v (restarting in %s)", err, backoff)
+		} else {
+			log.Printf("gateway: eventwatcher: stream ended cleanly (restarting in %s)", backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2
+		if backoff > eventWatcherMaxBackoff {
+			backoff = eventWatcherMaxBackoff
+		}
+	}
 }
 
 // createInvoiceRequest is the JSON body accepted by POST /invoice.
@@ -159,9 +233,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 // newHandler builds the Phase 1a HTTP surface: POST /invoice (create) and GET
-// /invoice/{id} (fetch current state). No admin UI, no webhook delivery — both
-// explicitly Phase 1b, per the task brief.
-func newHandler(store *invoice.Store, defaultTTL time.Duration) http.Handler {
+// /invoice/{id} (fetch current state). Returns the concrete *http.ServeMux (rather
+// than the http.Handler interface) so main() can register Phase 1b's admin routes
+// onto the same mux afterwards via adminServer.RegisterRoutes — see that method's own
+// doc comment for why routes are composed this way instead of each package owning its
+// own top-level handler.
+func newHandler(store *invoice.Store, defaultTTL time.Duration) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /invoice", func(w http.ResponseWriter, r *http.Request) {
