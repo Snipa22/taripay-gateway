@@ -47,21 +47,31 @@ const DefaultInvoiceTTLMinutes = 30
 // Env var names, following this org's <PROJECT>_<FIELD> convention (see
 // go-tari-ootle-explorer's TARI_OOTLE_EXPLORER_* / this repo's TARIPAY_* prefix).
 const (
-	envConfigFile        = "TARIPAY_CONFIG_FILE"
-	envWalletGRPCAddress = "TARIPAY_WALLET_GRPC_ADDR"
-	envPostgresDSN       = "TARIPAY_POSTGRES_DSN"
-	envHTTPListenAddr    = "TARIPAY_HTTP_LISTEN_ADDR"
-	envConfirmationDepth = "TARIPAY_CONFIRMATION_DEPTH"
-	envInvoiceTTLMinutes = "TARIPAY_INVOICE_TTL_MINUTES"
+	envConfigFile         = "TARIPAY_CONFIG_FILE"
+	envWalletGRPCAddress  = "TARIPAY_WALLET_GRPC_ADDR"
+	envPostgresDSN        = "TARIPAY_POSTGRES_DSN"
+	envHTTPListenAddr     = "TARIPAY_HTTP_LISTEN_ADDR"
+	envConfirmationDepth  = "TARIPAY_CONFIRMATION_DEPTH"
+	envInvoiceTTLMinutes  = "TARIPAY_INVOICE_TTL_MINUTES"
+	envWebhookCallbackURL = "TARIPAY_WEBHOOK_CALLBACK_URL"
+	envWebhookHMACSecret  = "TARIPAY_WEBHOOK_HMAC_SECRET"
 )
 
 // Config is the fully-resolved, ready-to-use configuration.
+//
+// WebhookCallbackURL/WebhookHMACSecret (Phase 1b) have no default — unlike
+// PostgresDSN, an unset value here is NOT a hard error at Load() time: invoice
+// creation/lookup must keep working standalone even if the merchant hasn't wired up
+// webhook delivery yet. cmd/gateway is responsible for logging a warning (not
+// failing startup) when either is empty, per the task brief.
 type Config struct {
-	WalletGRPCAddress string
-	PostgresDSN       string
-	HTTPListenAddr    string
-	ConfirmationDepth int
-	InvoiceTTLMinutes int
+	WalletGRPCAddress  string
+	PostgresDSN        string
+	HTTPListenAddr     string
+	ConfirmationDepth  int
+	InvoiceTTLMinutes  int
+	WebhookCallbackURL string
+	WebhookHMACSecret  string
 }
 
 // Flags holds every CLI-flag-shaped override this package accepts. Callers (cmd/*
@@ -74,12 +84,14 @@ type Config struct {
 // would make "flag not passed" indistinguishable from "flag explicitly set to 0" and
 // therefore always win over env/file/default.
 type Flags struct {
-	ConfigFile        string
-	WalletGRPCAddress string
-	PostgresDSN       string
-	HTTPListenAddr    string
-	ConfirmationDepth *int
-	InvoiceTTLMinutes *int
+	ConfigFile         string
+	WalletGRPCAddress  string
+	PostgresDSN        string
+	HTTPListenAddr     string
+	ConfirmationDepth  *int
+	InvoiceTTLMinutes  *int
+	WebhookCallbackURL string
+	WebhookHMACSecret  string
 }
 
 // fileConfig is the raw shape decoded from an optional TOML config file. A config file
@@ -87,11 +99,13 @@ type Flags struct {
 // default config file path, per AGENTS.md's rule against hardcoded/implicit infra
 // assumptions.
 type fileConfig struct {
-	WalletGRPCAddress string `toml:"wallet_grpc_address"`
-	PostgresDSN       string `toml:"postgres_dsn"`
-	HTTPListenAddr    string `toml:"http_listen_addr"`
-	ConfirmationDepth *int   `toml:"confirmation_depth"`
-	InvoiceTTLMinutes *int   `toml:"invoice_ttl_minutes"`
+	WalletGRPCAddress  string `toml:"wallet_grpc_address"`
+	PostgresDSN        string `toml:"postgres_dsn"`
+	HTTPListenAddr     string `toml:"http_listen_addr"`
+	ConfirmationDepth  *int   `toml:"confirmation_depth"`
+	InvoiceTTLMinutes  *int   `toml:"invoice_ttl_minutes"`
+	WebhookCallbackURL string `toml:"webhook_callback_url"`
+	WebhookHMACSecret  string `toml:"webhook_hmac_secret"`
 }
 
 // Load resolves a Config from flags, env vars, an optional TOML config file, and this
@@ -136,12 +150,22 @@ func Load(flags Flags) (*Config, error) {
 		return nil, fmt.Errorf("config: %s: %w", envInvoiceTTLMinutes, err)
 	}
 
+	// WebhookCallbackURL/WebhookHMACSecret: no default, and deliberately NOT
+	// validated as required here (contrast PostgresDSN above) — see this
+	// package's Config doc comment: cmd/gateway must still start and serve
+	// invoice creation/lookup with webhook delivery unconfigured, only warning
+	// (not failing) when either is empty.
+	webhookCallbackURL := firstNonEmpty(flags.WebhookCallbackURL, os.Getenv(envWebhookCallbackURL), file.WebhookCallbackURL)
+	webhookHMACSecret := firstNonEmpty(flags.WebhookHMACSecret, os.Getenv(envWebhookHMACSecret), file.WebhookHMACSecret)
+
 	return &Config{
-		WalletGRPCAddress: walletAddr,
-		PostgresDSN:       postgresDSN,
-		HTTPListenAddr:    httpAddr,
-		ConfirmationDepth: confirmationDepth,
-		InvoiceTTLMinutes: invoiceTTLMinutes,
+		WalletGRPCAddress:  walletAddr,
+		PostgresDSN:        postgresDSN,
+		HTTPListenAddr:     httpAddr,
+		ConfirmationDepth:  confirmationDepth,
+		InvoiceTTLMinutes:  invoiceTTLMinutes,
+		WebhookCallbackURL: webhookCallbackURL,
+		WebhookHMACSecret:  webhookHMACSecret,
 	}, nil
 }
 
