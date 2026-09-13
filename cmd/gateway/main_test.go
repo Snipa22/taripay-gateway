@@ -5,9 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,11 +61,18 @@ func setupTestServer(t *testing.T, resolveErr error) *httptest.Server {
 		return "fake-address-for-" + paymentID, nil
 	}
 	store := invoice.NewStore(pool, resolveAddress)
-	handler := newHandler(store, 30*time.Minute)
+	handler := newHandler(store, 30*time.Minute, pool, fakeWalletConnectivityOnline, "test")
 
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// fakeWalletConnectivityOnline is a getWalletConnectivityFunc stub reporting the
+// wallet as always online — the default used by setupTestServer above for tests
+// that don't care about GET /health's wallet-connectivity branch specifically.
+func fakeWalletConnectivityOnline() (*tari_generated.CheckConnectivityResponse, error) {
+	return &tari_generated.CheckConnectivityResponse{Status: tari_generated.CheckConnectivityResponse_Online}, nil
 }
 
 func TestPostInvoice_Success(t *testing.T) {
@@ -213,6 +224,412 @@ func TestGetInvoice_InvalidID(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// ---- request-hardening tests (task brief part 2, security-boundaries persona I5)
+// ----
+
+// captureLog redirects the standard logger's output to an in-memory buffer for the
+// duration of the calling test (restored via t.Cleanup) — used by the part 3
+// no-leak tests below to assert that a generic-error path still logs the real
+// error detail server-side, per the task brief's explicit "assert on the log
+// output in the test, not just the response body" requirement.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prevOutput := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		log.SetOutput(prevOutput)
+	})
+	return &buf
+}
+
+// verifyNoRowForOrderRef opens its own short-lived connection to
+// TARIPAY_TEST_POSTGRES_DSN (deliberately separate from setupTestServer's
+// internal pool, which isn't exposed to callers) and asserts no invoices row
+// exists for orderRef — used to confirm a rejected create request never reached
+// store.Create/the INSERT at all.
+func verifyNoRowForOrderRef(t *testing.T, orderRef string) {
+	t.Helper()
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM invoices WHERE order_ref = $1`, orderRef).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("invoices with order_ref=%s = %d, want 0 (rejected request must not insert a row)", orderRef, count)
+	}
+}
+
+// TestPostInvoice_AmountExceedsMaxInt64 covers the amount_utari upper-bound check
+// (task brief part 2): a value one past math.MaxInt64 must be rejected with a
+// clean 400, and — critically — must never reach store.Create/the underlying
+// int64 BIGINT column, where it would otherwise silently wrap around to a
+// negative number.
+func TestPostInvoice_AmountExceedsMaxInt64(t *testing.T) {
+	srv := setupTestServer(t, nil)
+
+	overflowAmount := uint64(math.MaxInt64) + 1
+	body, _ := json.Marshal(createInvoiceRequest{OrderRef: "order-overflow", AmountUTari: overflowAmount})
+	resp, err := http.Post(srv.URL+"/invoice", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /invoice: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (amount_utari > math.MaxInt64 must be rejected, not silently wrapped)", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	verifyNoRowForOrderRef(t, "order-overflow")
+}
+
+// TestPostInvoice_AmountAtMaxInt64IsAccepted confirms the boundary itself
+// (math.MaxInt64 exactly) is NOT rejected — only values strictly greater than it,
+// per the task brief's exact "amount_utari > math.MaxInt64" check.
+func TestPostInvoice_AmountAtMaxInt64IsAccepted(t *testing.T) {
+	srv := setupTestServer(t, nil)
+
+	body, _ := json.Marshal(createInvoiceRequest{OrderRef: "order-boundary", AmountUTari: uint64(math.MaxInt64)})
+	resp, err := http.Post(srv.URL+"/invoice", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /invoice: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (amount_utari == math.MaxInt64 must be accepted)", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+// TestPostInvoice_OversizedBodyReturns400 covers the http.MaxBytesReader body-size
+// cap (task brief part 2): a request body over maxInvoiceBodyBytes must get a
+// clean 400, not a panic/500.
+func TestPostInvoice_OversizedBodyReturns400(t *testing.T) {
+	srv := setupTestServer(t, nil)
+
+	// Pad an otherwise-valid JSON body with a long order_ref so the
+	// oversized-body path (http.MaxBytesReader cutting the read off) is what's
+	// actually exercised, not just "the JSON happens to be malformed".
+	oversizedOrderRef := strings.Repeat("a", maxInvoiceBodyBytes+1)
+	body, _ := json.Marshal(createInvoiceRequest{OrderRef: oversizedOrderRef, AmountUTari: 1000})
+	resp, err := http.Post(srv.URL+"/invoice", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /invoice: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (oversized body must be a clean 400, not a panic/500)", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// ---- generic-error-response tests (task brief part 3, I4 security-boundaries
+// persona) ----
+
+// TestPostInvoice_WalletFailureDoesNotLeakDetail confirms the wallet-unreachable
+// 502 path no longer returns err.Error()'s content verbatim (specifically: no
+// substring of a fake-but-realistic wallet gRPC dial address appears in the
+// response body), while the full detail is still logged server-side alongside a
+// correlation id that also appears in the response body.
+func TestPostInvoice_WalletFailureDoesNotLeakDetail(t *testing.T) {
+	sensitiveDetail := "rpc error: code = Unavailable desc = connection error: dial tcp 10.0.0.5:18143: connect: connection refused"
+	srv := setupTestServer(t, errors.New(sensitiveDetail))
+	logBuf := captureLog(t)
+
+	body, _ := json.Marshal(createInvoiceRequest{OrderRef: "order-leak-check", AmountUTari: 1000})
+	resp, err := http.Post(srv.URL+"/invoice", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /invoice: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if strings.Contains(string(respBody), "10.0.0.5") || strings.Contains(string(respBody), "dial tcp") {
+		t.Errorf("response body leaks internal wallet gRPC dial detail: %s", respBody)
+	}
+
+	var got errorResponse
+	if err := json.Unmarshal(respBody, &got); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got.Error == "" {
+		t.Error("Error is empty, want a generic description of the failure")
+	}
+	if got.CorrelationID == "" {
+		t.Error("CorrelationID is empty, want a correlation id linking this response to the server-side log line")
+	}
+
+	if !strings.Contains(logBuf.String(), sensitiveDetail) {
+		t.Errorf("server log missing the full wallet error detail, log:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), got.CorrelationID) {
+		t.Errorf("server log missing the correlation id %q returned to the client, log:\n%s", got.CorrelationID, logBuf.String())
+	}
+}
+
+// TestGetInvoice_DBErrorDoesNotLeakDetail confirms the DB-error 500 path no
+// longer returns err.Error()'s content verbatim (specifically: no SQL error text
+// naming the missing relation appears in the response body), while the full
+// detail is still logged server-side alongside a correlation id that also
+// appears in the response body. A genuine internal DB error (as opposed to
+// ErrNotFound) is forced by dropping the invoices table out from under a running
+// server before the request.
+func TestGetInvoice_DBErrorDoesNotLeakDetail(t *testing.T) {
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	store := invoice.NewStore(pool, func(paymentID string) (string, error) {
+		return "fake-address-for-" + paymentID, nil
+	})
+	handler := newHandler(store, 30*time.Minute, pool, fakeWalletConnectivityOnline, "test")
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	// Force a genuine internal DB-level error (not ErrNotFound): GetByID's
+	// query will fail with a real Postgres error naming the missing relation
+	// — exactly the kind of "SQL error detail" this fix must not leak.
+	if _, err := pool.Exec(ctx, `DROP TABLE invoices CASCADE`); err != nil {
+		t.Fatalf("drop invoices table: %v", err)
+	}
+
+	logBuf := captureLog(t)
+
+	resp, err := http.Get(srv.URL + "/invoice/" + uuid.New().String())
+	if err != nil {
+		t.Fatalf("GET /invoice/{id}: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	// Checking for "relation" alone would false-positive against this
+	// response's own "correlation_id" field name, so this checks for the
+	// more specific leaked details instead: the missing-table SQL phrasing
+	// and the literal (plural) table name, neither of which the generic
+	// message includes.
+	lowerBody := strings.ToLower(string(respBody))
+	if strings.Contains(lowerBody, "does not exist") || strings.Contains(lowerBody, "invoices\"") {
+		t.Errorf("response body leaks internal SQL error detail: %s", respBody)
+	}
+
+	var got errorResponse
+	if err := json.Unmarshal(respBody, &got); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got.Error == "" {
+		t.Error("Error is empty, want a generic description of the failure")
+	}
+	if got.CorrelationID == "" {
+		t.Error("CorrelationID is empty, want a correlation id linking this response to the server-side log line")
+	}
+
+	if !strings.Contains(strings.ToLower(logBuf.String()), "does not exist") {
+		t.Errorf("server log missing the full SQL error detail, log:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), got.CorrelationID) {
+		t.Errorf("server log missing the correlation id %q returned to the client, log:\n%s", got.CorrelationID, logBuf.String())
+	}
+}
+
+// ---- /health tests (task brief part 4, I13/I27) ----
+
+// TestHealth_AllReachableReturns200 confirms GET /health returns 200 with
+// wallet_connected/db_connected both true when both dependencies are reachable —
+// setupTestServer's default fakeWalletConnectivityOnline plus a real, live test
+// Postgres connection.
+func TestHealth_AllReachableReturns200(t *testing.T) {
+	srv := setupTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /health response: %v", err)
+	}
+	if got.Status != "ok" {
+		t.Errorf("Status = %q, want %q", got.Status, "ok")
+	}
+	if !got.WalletConnected {
+		t.Error("WalletConnected = false, want true (mocked wallet connectivity reports online)")
+	}
+	if !got.DBConnected {
+		t.Error("DBConnected = false, want true (live test Postgres is reachable)")
+	}
+	if got.Version == "" {
+		t.Error("Version is empty, want the version string passed to newHandler")
+	}
+}
+
+// TestHealth_WalletUnreachableReturns503 confirms GET /health returns 503 (not
+// 200) when the wallet-connectivity check fails, even though the DB is reachable
+// — an orchestrator's readiness probe must reflect actual readiness, not just
+// "the HTTP listener answered".
+func TestHealth_WalletUnreachableReturns503(t *testing.T) {
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	store := invoice.NewStore(pool, func(paymentID string) (string, error) {
+		return "fake-address-for-" + paymentID, nil
+	})
+	fakeOffline := func() (*tari_generated.CheckConnectivityResponse, error) {
+		return nil, errors.New("wallet: connection refused")
+	}
+	handler := newHandler(store, 30*time.Minute, pool, fakeOffline, "test")
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	var got healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /health response: %v", err)
+	}
+	if got.WalletConnected {
+		t.Error("WalletConnected = true, want false")
+	}
+	if !got.DBConnected {
+		t.Error("DBConnected = false, want true (DB is actually reachable in this test)")
+	}
+	if got.Status != "unavailable" {
+		t.Errorf("Status = %q, want %q", got.Status, "unavailable")
+	}
+}
+
+// TestHealth_DBUnreachableReturns503 confirms GET /health returns 503 (not 200)
+// when the DB-ping check fails, even though the wallet check succeeds.
+func TestHealth_DBUnreachableReturns503(t *testing.T) {
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	store := invoice.NewStore(pool, func(paymentID string) (string, error) {
+		return "fake-address-for-" + paymentID, nil
+	})
+	handler := newHandler(store, 30*time.Minute, pool, fakeWalletConnectivityOnline, "test")
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	// Close the pool out from under the running server to simulate the DB
+	// becoming unreachable — pool.Ping inside the /health handler must then
+	// fail.
+	pool.Close()
+
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	var got healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /health response: %v", err)
+	}
+	if got.DBConnected {
+		t.Error("DBConnected = true, want false (pool was closed)")
+	}
+	if got.Status != "unavailable" {
+		t.Errorf("Status = %q, want %q", got.Status, "unavailable")
 	}
 }
 
