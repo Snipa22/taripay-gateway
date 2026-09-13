@@ -332,3 +332,70 @@ func TestRegisterAdminRoutes_SetTokenRegistersProtectedRoutes(t *testing.T) {
 		t.Fatalf("status = %d, want %d with the correct token, body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 }
+
+// ---- runWebhookRetryLoop tests (webhook-delivery-reliability fix, task brief part
+// 2, item 2) ----
+
+// setupWebhookStore connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema,
+// and returns a webhook.Store — sufficient on its own for
+// TestRunWebhookRetryLoop_StopsOnContextCancellation below, which never seeds any
+// delivery rows (an empty webhook_deliveries table needs no fixture invoice row).
+// Skips the calling test if no live Postgres DSN is configured.
+func setupWebhookStore(t *testing.T) *webhook.Store {
+	t.Helper()
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	return webhook.NewStore(pool)
+}
+
+// TestRunWebhookRetryLoop_StopsOnContextCancellation confirms runWebhookRetryLoop's
+// goroutine is actually wired to, and respects, its shutdown context: it starts
+// (ticking on a short interval so it's exercised at least once), and returns promptly
+// once ctx is cancelled — same "goroutine started, cancellation respected" shape as
+// the existing event-watcher supervisor loop (runEventWatcherWithBackoff), which this
+// test's structure mirrors. This deliberately does not test the full production 60s
+// webhookRetryTickerInterval — interval is passed in directly, short, so the test
+// doesn't need to wait anywhere near that long.
+func TestRunWebhookRetryLoop_StopsOnContextCancellation(t *testing.T) {
+	webhookStore := setupWebhookStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runWebhookRetryLoop(ctx, webhookStore, &fakeWebhookSender{}, 5*time.Millisecond)
+		close(done)
+	}()
+
+	// Give it a moment to actually start ticking (an empty webhook_deliveries
+	// table means each tick's RetryFailedDeliveries call is a fast, harmless
+	// no-op) before cancelling.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// runWebhookRetryLoop returned promptly after cancellation, as expected.
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWebhookRetryLoop did not return within 2s of context cancellation")
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -234,6 +235,37 @@ func (s *Store) IncrementAttempts(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+// ListRetryable returns every delivery eligible for an automatic background retry
+// (task brief part 2, item 2): status pending or failed, created within the last
+// maxAge, and with fewer than maxAttempts attempts so far. Oldest-first, so a long
+// backlog is worked through in the order it accumulated rather than newest-first.
+func (s *Store) ListRetryable(ctx context.Context, maxAge time.Duration, maxAttempts int) ([]*Delivery, error) {
+	cutoff := time.Now().UTC().Add(-maxAge)
+	rows, err := s.db.Query(ctx, `
+		SELECT id, invoice_id, callback_url, payload, status, attempts, last_error, response_code, created_at, delivered_at
+		FROM webhook_deliveries
+		WHERE status IN ($1, $2) AND created_at > $3 AND attempts < $4
+		ORDER BY created_at ASC
+	`, StatusFailed, StatusPending, cutoff, maxAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("webhook: list retryable: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Delivery
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("webhook: list retryable: rows: %w", err)
+	}
+	return out, nil
+}
+
 // rowScanner is the subset of pgx.Row's/pgx.Rows' interface scanDelivery needs —
 // satisfied by both QueryRow's return value and a *pgx.Rows during Next() iteration,
 // mirroring internal/invoice's own rowScanner precedent.
@@ -351,4 +383,76 @@ func Attempt(ctx context.Context, store *Store, sender SenderInterface, delivery
 		return fmt.Errorf("webhook: attempt: mark failed after non-2xx response: %w", markErr)
 	}
 	return nil
+}
+
+// DefaultRetryMaxAttempts caps how many total attempts (the initial delivery attempt
+// plus every retry, automatic or manual, combined) a delivery gets before
+// RetryFailedDeliveries stops picking it up automatically. An operator can still
+// force one more attempt past this cap via the admin UI's manual retry button (which
+// calls Attempt directly and does not consult this cap at all) — this only bounds the
+// *automatic* background retry loop, so a permanently-broken merchant callback URL
+// doesn't get hammered forever unattended.
+//
+// PLACEHOLDER, UNCONFIRMED default (same "reasonable-sounding guess, not
+// project-owner-approved" caveat as this repo's other placeholder defaults —
+// config.DefaultConfirmationDepth/DefaultInvoiceTTLMinutes,
+// cmd/gateway's eventWatcherMaxBackoff): 10 attempts, chosen so a genuinely transient
+// outage (a merchant's plugin/server restarting, a brief network blip) gets several
+// tries across the default 60s ticker interval (cmd/gateway's retryTickerInterval)
+// before this gateway gives up on it unattended, without retrying an obviously-dead
+// endpoint indefinitely.
+const DefaultRetryMaxAttempts = 10
+
+// DefaultRetryMaxAge bounds how far back RetryFailedDeliveries looks for eligible
+// pending/failed deliveries — rows older than this are treated as abandoned rather
+// than retried forever. A merchant callback URL that has been broken for longer than
+// this is a configuration problem worth a human operator's attention (via the admin
+// UI's webhook-deliveries log and its manual retry button), not something this
+// gateway should keep silently retrying in the background indefinitely.
+//
+// PLACEHOLDER, UNCONFIRMED default, same caveat as DefaultRetryMaxAttempts above: 24h
+// is a reasonable-sounding guess for "long enough to ride out a weekend outage,
+// short enough not to retry ancient rows forever" — not a value the project owner
+// (Alex) has explicitly signed off on.
+const DefaultRetryMaxAge = 24 * time.Hour
+
+// RetryFailedDeliveries is the automatic background retry loop (task brief part 2,
+// item 2): it queries store for every delivery currently eligible for retry (status
+// pending or failed, created within the last maxAge, attempts below
+// DefaultRetryMaxAttempts — see Store.ListRetryable) and calls Attempt for each one in
+// turn, via the exact same increment/send/mark sequence used by both the
+// event-watcher's initial delivery attempt and the admin UI's manual retry button —
+// this function does not duplicate that logic, only decides which rows to run it
+// against and when.
+//
+// Returns the count of deliveries actually processed (i.e. Attempt was called for
+// them) — regardless of whether that attempt itself then succeeded or failed;
+// "processed" means "given a retry try", not "delivered". A non-nil error is only
+// returned for an infra-level failure listing eligible rows in the first place (a
+// Store.ListRetryable failure); a per-delivery Attempt bookkeeping failure is logged
+// and that delivery is skipped (not counted, and not fatal to the rest of the batch)
+// rather than aborting the whole retry pass over one bad row — same
+// "log and keep going" precedent as internal/eventwatcher's handleEvent.
+//
+// This does NOT replace the admin UI's manual retry button (internal/admin's
+// handleWebhookRetry) — that remains available for an operator who wants to force an
+// immediate retry outside this function's periodic cycle (see
+// cmd/gateway/main.go's retry-ticker goroutine, which calls this on a fixed
+// interval). Both paths share the same underlying Attempt call, per the task brief's
+// explicit "don't duplicate the increment/send/mark logic" instruction.
+func RetryFailedDeliveries(ctx context.Context, store *Store, sender SenderInterface, maxAge time.Duration) (int, error) {
+	deliveries, err := store.ListRetryable(ctx, maxAge, DefaultRetryMaxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("webhook: retry failed deliveries: %w", err)
+	}
+
+	processed := 0
+	for _, d := range deliveries {
+		if err := Attempt(ctx, store, sender, d); err != nil {
+			log.Printf("webhook: retry failed deliveries: attempt bookkeeping for delivery %s: %v (skipping)", d.ID, err)
+			continue
+		}
+		processed++
+	}
+	return processed, nil
 }

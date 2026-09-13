@@ -38,6 +38,13 @@ const (
 	eventWatcherMaxBackoff     = 30 * time.Second
 )
 
+// webhookRetryTickerInterval is how often runWebhookRetryLoop below calls
+// webhook.RetryFailedDeliveries (task brief part 2, item 2). 60s is a PLACEHOLDER,
+// UNCONFIRMED value — same "reasonable-sounding guess, not project-owner-approved"
+// caveat as eventWatcherInitialBackoff/eventWatcherMaxBackoff above and
+// webhook.DefaultRetryMaxAge/DefaultRetryMaxAttempts.
+const webhookRetryTickerInterval = 60 * time.Second
+
 func main() {
 	configFile := flag.String("config", "", "Path to a TOML config file (env: TARIPAY_CONFIG_FILE)")
 	walletGRPCAddr := flag.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
@@ -130,6 +137,13 @@ func main() {
 	watcher := eventwatcher.NewWatcher(invoiceStore, webhookStore, sender, cfg.WebhookCallbackURL, walletGRPC.StreamTransactionEvents)
 	go runEventWatcherWithBackoff(ctx, watcher)
 
+	// Automatic background retry loop for failed/stuck webhook deliveries (task
+	// brief part 2, item 2). Started alongside the event-watcher supervisor loop
+	// above, stopped cleanly on the same shutdown ctx — see runWebhookRetryLoop's
+	// doc comment for how this composes with (and does not replace) the admin
+	// UI's manual retry button.
+	go runWebhookRetryLoop(ctx, webhookStore, sender, webhookRetryTickerInterval)
+
 	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances)
 	if err != nil {
 		log.Fatalf("gateway: admin: %v", err)
@@ -207,6 +221,41 @@ func runEventWatcherWithBackoff(ctx context.Context, watcher *eventwatcher.Watch
 		backoff *= 2
 		if backoff > eventWatcherMaxBackoff {
 			backoff = eventWatcherMaxBackoff
+		}
+	}
+}
+
+// runWebhookRetryLoop is the periodic automatic retry loop for failed/stuck webhook
+// deliveries (task brief part 2, item 2): every interval, it calls
+// webhook.RetryFailedDeliveries once (using webhook.DefaultRetryMaxAge as the
+// eligibility window — see that constant's doc comment), logs the outcome, and
+// repeats, until ctx is cancelled. Checking ctx.Done() in the select below (rather
+// than only ever waiting on the ticker) means a context that's already cancelled by
+// the time this runs returns promptly without waiting for a full tick interval first.
+//
+// This does NOT replace the admin UI's manual retry button (internal/admin's
+// handleWebhookRetry) — that stays available for an operator who wants to force an
+// immediate retry outside this periodic cycle. Both paths share the exact same
+// underlying webhook.Attempt call (via webhook.RetryFailedDeliveries here,
+// internal/admin's retryAndDescribe there) — neither duplicates the
+// increment/send/mark sequence.
+func runWebhookRetryLoop(ctx context.Context, webhookStore *webhook.Store, sender webhook.SenderInterface, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count, err := webhook.RetryFailedDeliveries(ctx, webhookStore, sender, webhook.DefaultRetryMaxAge)
+			if err != nil {
+				log.Printf("gateway: webhook retry loop: %v", err)
+				continue
+			}
+			if count > 0 {
+				log.Printf("gateway: webhook retry loop: retried %d delivery(ies)", count)
+			}
 		}
 	}
 }

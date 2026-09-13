@@ -415,3 +415,89 @@ func TestAttempt_NonSuccessStatusMarksFailed(t *testing.T) {
 		t.Errorf("ResponseCode = %v, want 503", got.ResponseCode)
 	}
 }
+
+// seedDelivery inserts a webhook_deliveries row with a fully-controlled
+// status/attempts/created_at, bypassing Store.Create (which always sets attempts=0,
+// created_at=now()) — needed for TestRetryFailedDeliveries below to construct rows
+// that are/aren't eligible for retry along every one of ListRetryable's three axes
+// (status, age, attempts count).
+func seedDelivery(t *testing.T, s *Store, invoiceID uuid.UUID, status string, attempts int, createdAt time.Time) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	_, err := s.db.Exec(context.Background(), `
+		INSERT INTO webhook_deliveries (id, invoice_id, callback_url, payload, status, attempts, created_at)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+	`, id, invoiceID, "https://merchant.example/webhook", `{}`, status, attempts, createdAt)
+	if err != nil {
+		t.Fatalf("seedDelivery: %v", err)
+	}
+	return id
+}
+
+// TestRetryFailedDeliveries seeds a mix of pending/failed/delivered rows — some
+// within maxAge, some older, some at (or past) the attempts cap — and confirms
+// RetryFailedDeliveries only calls sender.Send for the eligible ones, returns a count
+// matching exactly that set, and leaves every ineligible row completely untouched
+// (status/attempts unchanged, no Send call for it).
+func TestRetryFailedDeliveries(t *testing.T) {
+	s, invoiceID := setupStore(t)
+	ctx := context.Background()
+
+	const maxAge = 24 * time.Hour
+	now := time.Now().UTC()
+
+	// Eligible: failed, recent, under the attempts cap.
+	eligibleFailed := seedDelivery(t, s, invoiceID, StatusFailed, 1, now.Add(-time.Hour))
+	// Eligible: pending (never even attempted), recent, under the attempts cap.
+	eligiblePending := seedDelivery(t, s, invoiceID, StatusPending, 0, now.Add(-time.Minute))
+	// Ineligible: failed, but older than maxAge.
+	tooOld := seedDelivery(t, s, invoiceID, StatusFailed, 1, now.Add(-48*time.Hour))
+	// Ineligible: failed, recent, but already at the attempts cap.
+	atCap := seedDelivery(t, s, invoiceID, StatusFailed, DefaultRetryMaxAttempts, now.Add(-time.Hour))
+	// Ineligible: already delivered.
+	delivered := seedDelivery(t, s, invoiceID, StatusDelivered, 1, now.Add(-time.Hour))
+
+	spy := &spySender{statusCode: 200}
+	count, err := RetryFailedDeliveries(ctx, s, spy, maxAge)
+	if err != nil {
+		t.Fatalf("RetryFailedDeliveries() error = %v", err)
+	}
+	if count != 2 {
+		t.Errorf("count = %d, want 2 (only eligibleFailed + eligiblePending)", count)
+	}
+	if spy.calls != 2 {
+		t.Errorf("spy.calls = %d, want 2", spy.calls)
+	}
+
+	for _, id := range []uuid.UUID{eligibleFailed, eligiblePending} {
+		got, err := s.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetByID(%s) error = %v", id, err)
+		}
+		if got.Status != StatusDelivered {
+			t.Errorf("delivery %s Status = %q, want %q (must have been retried and succeeded)", id, got.Status, StatusDelivered)
+		}
+	}
+
+	for _, tc := range []struct {
+		name         string
+		id           uuid.UUID
+		wantStatus   string
+		wantAttempts int
+	}{
+		{"tooOld", tooOld, StatusFailed, 1},
+		{"atCap", atCap, StatusFailed, DefaultRetryMaxAttempts},
+		{"delivered", delivered, StatusDelivered, 1},
+	} {
+		got, err := s.GetByID(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("GetByID(%s) error = %v", tc.name, err)
+		}
+		if got.Status != tc.wantStatus {
+			t.Errorf("%s: Status = %q, want %q (must be untouched)", tc.name, got.Status, tc.wantStatus)
+		}
+		if got.Attempts != tc.wantAttempts {
+			t.Errorf("%s: Attempts = %d, want %d (must be untouched)", tc.name, got.Attempts, tc.wantAttempts)
+		}
+	}
+}
