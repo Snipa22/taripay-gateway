@@ -3,7 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <title>TariPay Gateway Admin</title>
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <!-- Vendored, self-hosted htmx.org@1.9.12 (task brief part 5, I11/I15) —
+         served from this package's own embedded static/htmx.min.js via
+         GET /admin/static/htmx.min.js, instead of loading it from unpkg.com.
+         See internal/admin/admin.go's handleHTMXStatic doc comment for
+         provenance/version details. -->
+    <script src="/admin/static/htmx.min.js"></script>
     <style>
         body { font-family: monospace; margin: 2rem; background: #0f0f12; color: #e6e6e6; }
         a { color: #7cc7ff; }
