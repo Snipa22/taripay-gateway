@@ -2,6 +2,7 @@ package eventwatcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"sync"
@@ -103,13 +104,21 @@ func fakeEventSource(evs []*tari_generated.TransactionEventResponse) EventSource
 // ship broken against real traffic while these mock-fixture-based tests kept passing
 // against the same wrong assumption. Don't revert this back to the long form.
 func inboundEvent(paymentID, status, txID string) *tari_generated.TransactionEventResponse {
+	return inboundEventWithAmount(paymentID, status, txID, 1000)
+}
+
+// inboundEventWithAmount is inboundEvent with an explicit txn.Amount, for the C2
+// amount-received-check tests below (TestRun_Underpaid*/TestRun_Overpayment) that need
+// to control the received amount independently of invA/invB/invC's shared 1000
+// default.
+func inboundEventWithAmount(paymentID, status, txID string, amount uint64) *tari_generated.TransactionEventResponse {
 	return &tari_generated.TransactionEventResponse{
 		Transaction: &tari_generated.TransactionEvent{
 			Event:         "Received",
 			TxId:          txID,
 			Status:        status,
 			Direction:     "Inbound",
-			Amount:        1000,
+			Amount:        amount,
 			UserPaymentId: []byte(paymentID),
 		},
 	}
@@ -136,7 +145,14 @@ func TestRun_FullSequence(t *testing.T) {
 	invoiceStore, webhookStore := setupStores(t)
 	ctx := context.Background()
 
-	invB, err := invoiceStore.Create(ctx, "order-b", 5000, time.Hour)
+	// invB's invoiced amount matches inboundEvent's fixed Amount (1000) exactly:
+	// the C2 amount-received-check fix (see watcher.go's handleEvent) means an
+	// event's confirmed transition now only sticks if the cumulative received
+	// amount is >= the invoiced amount, so this fixture must actually pay the
+	// invoice in full for this test's "first-time confirmed" expectation to
+	// hold. See TestRun_Underpaid*/TestRun_Overpayment below for dedicated
+	// coverage of the received-vs-invoiced comparison itself.
+	invB, err := invoiceStore.Create(ctx, "order-b", 1000, time.Hour)
 	if err != nil {
 		t.Fatalf("create invB: %v", err)
 	}
@@ -254,6 +270,215 @@ func TestRun_NoCallbackURLSkipsWebhookButStillUpdatesStatus(t *testing.T) {
 	}
 	if len(deliveries) != 0 {
 		t.Errorf("len(deliveries) = %d, want 0", len(deliveries))
+	}
+}
+
+// TestRun_UnderpaidSingleEvent covers the C2-fix's core new behavior: a single
+// confirmed-mapped event whose amount is less than the invoice's invoiced amount must
+// NOT confirm the invoice — it must land in StatusUnderpaid instead, and the webhook
+// fired must be "payment.underpaid" carrying both the invoiced and actually-received
+// amounts.
+func TestRun_UnderpaidSingleEvent(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-underpaid", 5000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-underpaid-1", 3000),
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusUnderpaid {
+		t.Errorf("Status = %q, want %q", got.Status, invoice.StatusUnderpaid)
+	}
+	if got.ConfirmedAt != nil {
+		t.Errorf("ConfirmedAt = %v, want nil (invoice never actually confirmed)", got.ConfirmedAt)
+	}
+	if got.AmountReceivedUTari != 3000 {
+		t.Errorf("AmountReceivedUTari = %d, want 3000", got.AmountReceivedUTari)
+	}
+
+	if spy.callCount() != 1 {
+		t.Fatalf("spy.callCount() = %d, want 1", spy.callCount())
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+
+	var payload webhook.Payload
+	if err := json.Unmarshal(deliveries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal delivery payload: %v", err)
+	}
+	if payload.Event != "payment.underpaid" {
+		t.Errorf("payload.Event = %q, want %q", payload.Event, "payment.underpaid")
+	}
+	if payload.Status != invoice.StatusUnderpaid {
+		t.Errorf("payload.Status = %q, want %q", payload.Status, invoice.StatusUnderpaid)
+	}
+	if payload.AmountUTari != 5000 {
+		t.Errorf("payload.AmountUTari (invoiced) = %d, want 5000", payload.AmountUTari)
+	}
+	if payload.AmountReceivedUTari != 3000 {
+		t.Errorf("payload.AmountReceivedUTari = %d, want 3000", payload.AmountReceivedUTari)
+	}
+}
+
+// TestRun_UnderpaidThenTopUpConfirms covers the "cumulative received amount" part of
+// the C2 fix: an initial underpayment followed by a second event whose additional
+// amount brings the running total exactly up to the invoiced amount must transition
+// the invoice underpaid -> confirmed and fire exactly one "payment.confirmed" webhook
+// — critically, NOT a second "payment.underpaid" webhook for the second event.
+func TestRun_UnderpaidThenTopUpConfirms(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-topup", 5000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-topup-1", 3000), // underpaid
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-topup-2", 2000), // brings total to exactly 5000
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it set once the invoice actually confirms")
+	}
+	if got.AmountReceivedUTari != 5000 {
+		t.Errorf("AmountReceivedUTari = %d, want 5000 (cumulative across both events)", got.AmountReceivedUTari)
+	}
+
+	// Exactly 2 webhooks: payment.underpaid (first event), payment.confirmed
+	// (second event) — NOT a duplicate payment.underpaid or any extra webhook.
+	if spy.callCount() != 2 {
+		t.Fatalf("spy.callCount() = %d, want 2", spy.callCount())
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 2 {
+		t.Fatalf("len(deliveries) = %d, want 2", len(deliveries))
+	}
+
+	var deliveredEvents []string
+	for _, d := range deliveries {
+		var payload webhook.Payload
+		if err := json.Unmarshal(d.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal delivery payload: %v", err)
+		}
+		deliveredEvents = append(deliveredEvents, payload.Event)
+	}
+	wantEvents := map[string]int{"payment.underpaid": 1, "payment.confirmed": 1}
+	gotEvents := map[string]int{}
+	for _, e := range deliveredEvents {
+		gotEvents[e]++
+	}
+	for event, want := range wantEvents {
+		if gotEvents[event] != want {
+			t.Errorf("delivered event %q count = %d, want %d (got events: %v)", event, gotEvents[event], want, deliveredEvents)
+		}
+	}
+	if len(gotEvents) != len(wantEvents) {
+		t.Errorf("delivered events = %v, want exactly %v (no extra/duplicate events)", gotEvents, wantEvents)
+	}
+}
+
+// TestRun_OverpaymentConfirmsNormally covers the design decision's other half:
+// received > invoiced confirms normally, on the first event, with no special
+// "overpaid" status.
+func TestRun_OverpaymentConfirmsNormally(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-overpaid", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+
+	events := []*tari_generated.TransactionEventResponse{
+		inboundEventWithAmount(inv.PaymentID, "Mined Confirmed", "tx-overpaid-1", 1500),
+	}
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", fakeEventSource(events))
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q (overpayment confirms normally)", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it set")
+	}
+	if got.AmountReceivedUTari != 1500 {
+		t.Errorf("AmountReceivedUTari = %d, want 1500", got.AmountReceivedUTari)
+	}
+
+	if spy.callCount() != 1 {
+		t.Fatalf("spy.callCount() = %d, want 1", spy.callCount())
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+	var payload webhook.Payload
+	if err := json.Unmarshal(deliveries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal delivery payload: %v", err)
+	}
+	if payload.Event != "payment.confirmed" {
+		t.Errorf("payload.Event = %q, want %q (no special overpaid event)", payload.Event, "payment.confirmed")
+	}
+	if payload.Status != invoice.StatusConfirmed {
+		t.Errorf("payload.Status = %q, want %q", payload.Status, invoice.StatusConfirmed)
+	}
+	if payload.AmountUTari != 1000 {
+		t.Errorf("payload.AmountUTari (invoiced) = %d, want 1000", payload.AmountUTari)
+	}
+	if payload.AmountReceivedUTari != 1500 {
+		t.Errorf("payload.AmountReceivedUTari = %d, want 1500", payload.AmountReceivedUTari)
 	}
 }
 

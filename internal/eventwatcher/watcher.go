@@ -230,13 +230,50 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 		return
 	}
 
-	newStatus, webhookEvent := mapStatus(txn.Status)
+	mappedStatus, webhookEvent := mapStatus(txn.Status)
 	previousStatus := inv.Status
 
+	// newStatus/confirmedAt/amountReceived default to mappedStatus's own verdict
+	// and are only overridden below for the confirmed-vs-underpaid decision (the
+	// C2 fix, task brief part 1). This is deliberately scoped to ONLY the
+	// mapStatus-computed-StatusConfirmed case: a chain-level status downgrade on
+	// a later event (e.g. mapStatus returning StatusRejected) must not re-run
+	// amount accumulation, per the brief's explicit "write this defensively"
+	// instruction.
+	newStatus := mappedStatus
 	var confirmedAt *time.Time
-	if newStatus == invoice.StatusConfirmed {
-		now := time.Now().UTC()
-		confirmedAt = &now
+	amountReceived := inv.AmountReceivedUTari
+
+	if mappedStatus == invoice.StatusConfirmed {
+		// Design decision (per the task brief, not reopened here): "received >=
+		// invoiced" is the pass condition. Exact-match would be too strict for
+		// real-world transfer-fee/rounding edge cases; no check at all (the
+		// original C2 bug) let anyone who knew the payment_id confirm an
+		// invoice for an arbitrary, possibly much smaller, amount. Overpayment
+		// is accepted and confirms normally — a merchant can always manually
+		// refund/credit the difference; underpayment does NOT confirm, and
+		// instead lands the invoice in StatusUnderpaid (see that constant's
+		// doc comment) until a later event's cumulative total catches up.
+		//
+		// AddReceivedAmount does an atomic accumulate-and-return rather than a
+		// read-then-write, so the invoice's running total (not just this one
+		// event's txn.Amount in isolation) is what's compared below — this is
+		// what lets a second, top-up transfer for the same invoice eventually
+		// push it from underpaid to confirmed.
+		total, err := w.invoiceStore.AddReceivedAmount(ctx, inv.ID, txn.Amount)
+		if err != nil {
+			log.Printf("eventwatcher: add received amount for invoice %s: %v", inv.ID, err)
+			return
+		}
+		amountReceived = total
+
+		if total < inv.AmountUTari {
+			newStatus = invoice.StatusUnderpaid
+			webhookEvent = "payment.underpaid"
+		} else {
+			now := time.Now().UTC()
+			confirmedAt = &now
+		}
 	}
 
 	if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
@@ -247,30 +284,34 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 	if previousStatus == newStatus {
 		// No actual transition (e.g. a repeat MINED_CONFIRMED event for an
 		// already-confirmed invoice) — UpdateStatus above is harmless/idempotent,
-		// but do NOT refire a webhook for it.
+		// but do NOT refire a webhook for it. This guard applies uniformly to
+		// StatusUnderpaid too (per the task brief): if the same transaction is
+		// somehow re-processed while the invoice is already underpaid, no
+		// duplicate payment.underpaid webhook fires either.
 		return
 	}
 
-	w.fireWebhook(ctx, inv, newStatus, webhookEvent, txn, confirmedAt)
+	w.fireWebhook(ctx, inv, newStatus, webhookEvent, txn, confirmedAt, amountReceived)
 }
 
 // fireWebhook builds the webhook payload for a status transition, records a pending
 // delivery row, and attempts delivery. If callbackURL is unconfigured, it logs and
 // skips delivery entirely (invoice status has already been updated regardless).
-func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent string, txn *tari_generated.TransactionEvent, confirmedAt *time.Time) {
+func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent string, txn *tari_generated.TransactionEvent, confirmedAt *time.Time, amountReceived uint64) {
 	if w.callbackURL == "" {
 		log.Printf("eventwatcher: webhook callback URL not configured, skipping webhook for invoice %s (event=%s)", inv.ID, webhookEvent)
 		return
 	}
 
 	payload := webhook.Payload{
-		InvoiceID:   inv.ID.String(),
-		PaymentID:   inv.PaymentID,
-		OrderRef:    inv.OrderRef,
-		Status:      newStatus,
-		AmountUTari: inv.AmountUTari,
-		TxID:        txn.TxId,
-		Event:       webhookEvent,
+		InvoiceID:           inv.ID.String(),
+		PaymentID:           inv.PaymentID,
+		OrderRef:            inv.OrderRef,
+		Status:              newStatus,
+		AmountUTari:         inv.AmountUTari,
+		AmountReceivedUTari: amountReceived,
+		TxID:                txn.TxId,
+		Event:               webhookEvent,
 	}
 	if confirmedAt != nil {
 		payload.ConfirmedAt = confirmedAt.Format(time.RFC3339)
