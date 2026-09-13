@@ -21,6 +21,11 @@
 // reconciliation sweep (task brief part 1, S2/I7) has exactly the set of invoices
 // that could still need a status transition from wallet state missed during
 // downtime.
+//
+// The 2026-09-13 idempotent-invoice-creation fix (task brief part 1, I5/AI-16) adds
+// one more: the GetActiveByOrderRef method, which Create now calls internally to
+// make invoice creation idempotent on order_ref for the lifetime of a non-terminal
+// invoice — see both methods' doc comments for the exact contract.
 package invoice
 
 import (
@@ -154,17 +159,38 @@ func (s *Store) Pool() *pgxpool.Pool {
 	return s.db
 }
 
-// Create generates a new invoice: a UUID (used as both the row's id and, as its
-// string form, the wallet payment_id — see the doc comment on that field below),
-// resolves a payment address for it via the injected resolveAddress func, and inserts
-// the row. If address resolution fails, no row is inserted (no orphan invoices with no
-// valid address) and the error is returned as-is (wrapped) to the caller.
+// Create is idempotent on orderRef (the I5/AI-16 fix, task brief part 1): it first
+// calls GetActiveByOrderRef, and if a non-terminal invoice already exists for
+// orderRef, returns THAT invoice instead of creating a new one — no error, no new
+// error type for the caller, "create or return existing" is the entire contract. This
+// means a lost-response retry from the cart plugin (a second POST /invoice for the
+// same order while the first invoice is still pending/seen/underpaid) is safe: it
+// returns the same invoice/address rather than minting a second one with a different
+// address for the same order. A genuinely new order that happens to reuse an
+// order_ref after the original invoice went terminal (confirmed/rejected/expired/
+// cancelled) is unaffected and gets a real new invoice — see GetActiveByOrderRef's
+// doc comment for the exact scoping.
+//
+// If no active invoice exists, proceeds with the original creation logic: generates
+// a UUID (used as both the row's id and, as its string form, the wallet payment_id
+// — see the doc comment on that field below), resolves a payment address for it via
+// the injected resolveAddress func, and inserts the row. If address resolution
+// fails, no row is inserted (no orphan invoices with no valid address) and the
+// error is returned as-is (wrapped) to the caller.
 //
 // payment_id is deliberately just id.String() rather than a separately-generated
 // value: the brief's own suggestion, and it keeps the two trivially correlatable
 // (looking up an invoice by either its DB id or its wallet payment_id always finds the
 // same row) with no risk of them ever drifting apart.
 func (s *Store) Create(ctx context.Context, orderRef string, amountUTari uint64, ttl time.Duration) (*Invoice, error) {
+	existing, err := s.GetActiveByOrderRef(ctx, orderRef)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("invoice: check active order_ref %s: %w", orderRef, err)
+	}
+
 	id := uuid.New()
 	paymentID := id.String()
 
@@ -213,6 +239,38 @@ func (s *Store) GetByPaymentID(ctx context.Context, paymentID string) (*Invoice,
 		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
 		FROM invoices WHERE payment_id = $1
 	`, paymentID)
+	return scanInvoice(row)
+}
+
+// GetActiveByOrderRef looks up the most recent NON-TERMINAL invoice for orderRef —
+// i.e. one whose current status is not in TerminalStatuses (see that var's doc
+// comment). Returns ErrNotFound if no such invoice exists, either because orderRef
+// has never been used, or because every invoice ever created for it has since
+// reached a terminal status (in which case a new invoice for the same orderRef is
+// fine to create — see Create's doc comment).
+//
+// Added for the idempotent-invoice-creation fix (task brief part 1, I5/AI-16):
+// Create calls this first so a lost-response retry from the cart plugin doesn't
+// mint a second invoice/address for the same order. "Most recent" (ORDER BY
+// created_at DESC LIMIT 1) matters only in the pathological case of more than one
+// non-terminal row somehow existing for the same orderRef (e.g. a race between two
+// concurrent Create calls before either transitions to terminal — see this
+// package's migrations/0004_order_ref_active_index.up.sql doc comment for why that
+// race is accepted rather than closed with a DB-level uniqueness constraint); the
+// normal case is at most one non-terminal row per orderRef.
+func (s *Store) GetActiveByOrderRef(ctx context.Context, orderRef string) (*Invoice, error) {
+	terminal := make([]string, 0, len(TerminalStatuses))
+	for status := range TerminalStatuses {
+		terminal = append(terminal, status)
+	}
+
+	row := s.db.QueryRow(ctx, `
+		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		FROM invoices
+		WHERE order_ref = $1 AND status != ALL($2)
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, orderRef, terminal)
 	return scanInvoice(row)
 }
 

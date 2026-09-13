@@ -112,6 +112,134 @@ func TestCreate_WalletResolutionFailureInsertsNoRow(t *testing.T) {
 	}
 }
 
+// TestCreate_IdempotentWhileNonTerminal covers the idempotent-invoice-creation fix
+// (task brief part 1, I5/AI-16): two Create calls with the same order_ref while the
+// first invoice is still non-terminal (pending, here) must return the SAME invoice
+// (same ID), not create a second row for the same order_ref.
+func TestCreate_IdempotentWhileNonTerminal(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	first, err := s.Create(ctx, "order-idempotent", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("Create() #1 error = %v", err)
+	}
+	if first.Status != StatusPending {
+		t.Fatalf("Create() #1 Status = %q, want %q", first.Status, StatusPending)
+	}
+
+	second, err := s.Create(ctx, "order-idempotent", 9999, time.Hour)
+	if err != nil {
+		t.Fatalf("Create() #2 error = %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("Create() #2 ID = %v, want it to equal Create() #1's ID %v (idempotent retry must return the same invoice)", second.ID, first.ID)
+	}
+	// The second call's differing amount must be ignored — the existing
+	// invoice's own amount/address are returned unchanged, not overwritten.
+	if second.AmountUTari != first.AmountUTari {
+		t.Errorf("Create() #2 AmountUTari = %d, want %d (unchanged from the original invoice)", second.AmountUTari, first.AmountUTari)
+	}
+	if second.Address != first.Address {
+		t.Errorf("Create() #2 Address = %q, want %q (unchanged from the original invoice)", second.Address, first.Address)
+	}
+
+	var count int
+	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM invoices WHERE order_ref = $1`, "order-idempotent").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("invoices with order_ref=order-idempotent = %d, want 1 (no second row created)", count)
+	}
+
+	// A third call after the invoice transitions underpaid (still
+	// non-terminal) must still be idempotent.
+	if err := s.UpdateStatus(ctx, first.ID, StatusUnderpaid, nil); err != nil {
+		t.Fatalf("UpdateStatus(underpaid): %v", err)
+	}
+	third, err := s.Create(ctx, "order-idempotent", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("Create() #3 error = %v", err)
+	}
+	if third.ID != first.ID {
+		t.Errorf("Create() #3 ID = %v, want it to equal the original ID %v (still non-terminal)", third.ID, first.ID)
+	}
+}
+
+// TestCreate_TerminalOrderRefAllowsNewInvoice covers the other half of the
+// idempotent-invoice-creation fix's scoping: a Create call with an order_ref
+// matching an invoice that's already terminal (confirmed/rejected/expired/
+// cancelled) must create a genuinely NEW invoice, proving old completed orders
+// don't block reuse of the reference (e.g. a recycled WooCommerce order number).
+func TestCreate_TerminalOrderRefAllowsNewInvoice(t *testing.T) {
+	for _, terminalStatus := range []string{StatusConfirmed, StatusRejected, StatusExpired, StatusCancelled} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			s := setupStore(t, nil)
+			ctx := context.Background()
+
+			orderRef := "order-terminal-" + terminalStatus
+			first, err := s.Create(ctx, orderRef, 1000, time.Hour)
+			if err != nil {
+				t.Fatalf("Create() #1 error = %v", err)
+			}
+			if err := s.UpdateStatus(ctx, first.ID, terminalStatus, nil); err != nil {
+				t.Fatalf("UpdateStatus(%s): %v", terminalStatus, err)
+			}
+
+			second, err := s.Create(ctx, orderRef, 2000, time.Hour)
+			if err != nil {
+				t.Fatalf("Create() #2 error = %v", err)
+			}
+			if second.ID == first.ID {
+				t.Errorf("Create() #2 ID = %v, want a NEW id distinct from the terminal invoice's %v", second.ID, first.ID)
+			}
+			if second.AmountUTari != 2000 {
+				t.Errorf("Create() #2 AmountUTari = %d, want 2000 (a genuinely new invoice)", second.AmountUTari)
+			}
+
+			var count int
+			if err := s.db.QueryRow(ctx, `SELECT count(*) FROM invoices WHERE order_ref = $1`, orderRef).Scan(&count); err != nil {
+				t.Fatalf("count query: %v", err)
+			}
+			if count != 2 {
+				t.Errorf("invoices with order_ref=%s = %d, want 2 (old terminal + new)", orderRef, count)
+			}
+		})
+	}
+}
+
+// TestGetActiveByOrderRef covers GetActiveByOrderRef directly: not-found for an
+// unused order_ref, found for a non-terminal one, and not-found again once that
+// invoice becomes terminal.
+func TestGetActiveByOrderRef(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	if _, err := s.GetActiveByOrderRef(ctx, "order-never-used"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetActiveByOrderRef(never used) error = %v, want ErrNotFound", err)
+	}
+
+	inv, err := s.Create(ctx, "order-active-lookup", 500, time.Hour)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	got, err := s.GetActiveByOrderRef(ctx, "order-active-lookup")
+	if err != nil {
+		t.Fatalf("GetActiveByOrderRef() error = %v", err)
+	}
+	if got.ID != inv.ID {
+		t.Errorf("GetActiveByOrderRef().ID = %v, want %v", got.ID, inv.ID)
+	}
+
+	if err := s.UpdateStatus(ctx, inv.ID, StatusConfirmed, nil); err != nil {
+		t.Fatalf("UpdateStatus(confirmed): %v", err)
+	}
+	if _, err := s.GetActiveByOrderRef(ctx, "order-active-lookup"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetActiveByOrderRef(now terminal) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestGetByID_NotFound(t *testing.T) {
 	s := setupStore(t, nil)
 	ctx := context.Background()
