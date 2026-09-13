@@ -1,0 +1,37 @@
+{{define "content"}}
+<h2>Invoices</h2>
+<div class="status-filters">
+    Filter:
+    <a href="/admin/invoices">all</a>
+    <a href="/admin/invoices?status=pending">pending</a>
+    <a href="/admin/invoices?status=seen">seen</a>
+    <a href="/admin/invoices?status=confirmed">confirmed</a>
+    <a href="/admin/invoices?status=expired">expired</a>
+    <a href="/admin/invoices?status=cancelled">cancelled</a>
+    <a href="/admin/invoices?status=rejected">rejected</a>
+</div>
+
+{{if not .Invoices}}
+<p class="empty-note">No invoices{{if .StatusFilter}} with status "{{.StatusFilter}}"{{end}}.</p>
+{{else}}
+<table>
+    <thead>
+    <tr><th>Created</th><th>Order Ref</th><th>Amount (uT)</th><th>Status</th><th>Payment ID</th><th>Address</th><th>Expires</th><th>Confirmed</th></tr>
+    </thead>
+    <tbody>
+    {{range .Invoices}}
+    <tr>
+        <td>{{.CreatedAtDisplay}}</td>
+        <td>{{.OrderRef}}</td>
+        <td>{{.AmountUTari}}</td>
+        <td>{{.Status}}</td>
+        <td>{{.PaymentID}}</td>
+        <td>{{.Address}}</td>
+        <td>{{.ExpiresAtDisplay}}</td>
+        <td>{{.ConfirmedAtDisplay}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+</table>
+{{end}}
+{{end}}
