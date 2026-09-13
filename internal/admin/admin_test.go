@@ -239,6 +239,46 @@ func TestHandleWebhookRetry_CallsSenderAndUpdatesRecord(t *testing.T) {
 	}
 }
 
+// ---- static asset tests (task brief part 5, I11/I15: self-host HTMX) ----
+
+// TestHandleHTMXStatic_ReturnsEmbeddedFile confirms GET /admin/static/htmx.min.js
+// returns 200 with a JS content-type and a non-empty body — and, per this route's
+// documented "not privileged data" call (see RegisterRoutes' doc comment),
+// succeeds with NO Authorization header at all, unlike every other /admin* route.
+func TestHandleHTMXStatic_ReturnsEmbeddedFile(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, _, _ := setupServer(t, sender, nil, nil)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	// Deliberately unauthenticated request — httptest.NewRequest, not
+	// authedRequest — see this test's doc comment above.
+	req := httptest.NewRequest(http.MethodGet, "/admin/static/htmx.min.js", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	contentType := rec.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "javascript") {
+		t.Errorf("Content-Type = %q, want it to contain %q", contentType, "javascript")
+	}
+
+	body := rec.Body.Bytes()
+	if len(body) == 0 {
+		t.Fatal("body is empty, want the embedded htmx.min.js contents")
+	}
+	// A light sanity check that this is actually htmx (not an empty/
+	// placeholder stand-in file) without pinning to its exact minified
+	// bytes, which would make this test brittle across htmx version bumps.
+	if !strings.Contains(string(body), "htmx") {
+		t.Errorf("body does not contain the string %q, does not look like htmx.min.js", "htmx")
+	}
+}
+
 func TestHandleWebhookRetry_UnknownIDReturns404(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
 	srv, _, _ := setupServer(t, sender, nil, nil)

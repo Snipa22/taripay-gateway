@@ -29,6 +29,15 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// staticFS embeds this package's vendored static assets (task brief part 5,
+// I11/I15: self-host HTMX instead of loading it from unpkg.com) — same
+// //go:embed mechanism as templateFS above. See static/htmx.min.js's own
+// provenance note (below, on the route that serves it) for exactly what version
+// this is and where it came from.
+//
+//go:embed static/*.js
+var staticFS embed.FS
+
 // DashboardInvoiceLimit/DashboardDeliveryLimit are how many rows GET /admin's
 // "recent" panels show — per the task brief's "recent invoices (last 20, any
 // status)" / "recent webhook deliveries (last 20)" spec.
@@ -108,6 +117,49 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux, authToken string) {
 	mux.Handle("GET /admin", requireAuth(authToken, http.HandlerFunc(s.handleDashboard)))
 	mux.Handle("GET /admin/invoices", requireAuth(authToken, http.HandlerFunc(s.handleInvoices)))
 	mux.Handle("POST /admin/webhooks/{id}/retry", requireAuth(authToken, http.HandlerFunc(s.handleWebhookRetry)))
+
+	// GET /admin/static/htmx.min.js is deliberately NOT wrapped in
+	// requireAuth (task brief part 5, I11/I15): it's a static asset (this
+	// package's own vendored copy of htmx.org, not privileged merchant/order
+	// data), so gating it behind the admin bearer token would only make the
+	// dashboard itself harder to load for no confidentiality benefit — the
+	// same reasoning go-tari-ootle-explorer and go-crypto-pool-web apply to
+	// their own static assets. It's still only registered when RegisterRoutes
+	// itself is called (i.e. only when AdminAuthToken is configured — see
+	// cmd/gateway/main.go's registerAdminRoutes), consistent with "no admin
+	// routes at all, including this one, when admin auth is unconfigured" —
+	// though note this route serves no privileged data even when reachable,
+	// so that consistency is a minor/cosmetic call, not a security necessity.
+	mux.HandleFunc("GET /admin/static/htmx.min.js", s.handleHTMXStatic)
+}
+
+// handleHTMXStatic serves this package's vendored copy of htmx.org (task brief
+// part 5, I11/I15): the admin UI used to load HTMX from unpkg.com with no
+// Subresource Integrity hash and no fallback, so the one write action (webhook
+// retry) silently did nothing if that CDN was ever unreachable. Vendoring it here
+// removes that third-party runtime dependency entirely.
+//
+// static/htmx.min.js is htmx.org@1.9.12's dist/htmx.min.js, fetched directly from
+// https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js (the exact version
+// layout.html's <script> tag previously pointed at) at the time of this fix —
+// verbatim, unmodified. Bump both this file and layout.html's cache-busting
+// comment together if htmx is ever upgraded.
+func (s *Server) handleHTMXStatic(w http.ResponseWriter, r *http.Request) {
+	data, err := staticFS.ReadFile("static/htmx.min.js")
+	if err != nil {
+		// A missing embedded file here is a build-time packaging error, not
+		// a request-time/user-facing one — still logged, but there's no
+		// internal detail worth hiding from the client in this specific
+		// case (this route serves no privileged data, per its own doc
+		// comment above).
+		log.Printf("admin: read embedded static/htmx.min.js: %v", err)
+		http.Error(w, "static asset unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	if _, err := w.Write(data); err != nil {
+		log.Printf("admin: write static/htmx.min.js response: %v", err)
+	}
 }
 
 // ---- view adapters (presentation-only, keep invoice/webhook packages free of display
