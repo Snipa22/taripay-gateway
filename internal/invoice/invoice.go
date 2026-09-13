@@ -3,10 +3,12 @@
 // create a new invoice.
 //
 // Phase 1b (a separate, later dispatch — the event-watcher/webhook delivery loop and
-// the HTMX admin UI) will import this package's Store without full context of how it
-// was built, so its public surface is kept intentionally narrow: Create, GetByID,
-// GetByPaymentID, UpdateStatus, ExpireStale. Don't grow this surface speculatively
-// ahead of what Phase 1b actually needs.
+// the HTMX admin UI) imports this package's Store without full context of how it was
+// built, so its public surface was kept intentionally narrow through Phase 1a: Create,
+// GetByID, GetByPaymentID, UpdateStatus, ExpireStale. Phase 1b (this dispatch) adds
+// exactly two small, additive things on top, each cited at its own definition rather
+// than expanding the surface speculatively: the StatusRejected constant, and a List
+// method for the admin UI's invoice-listing views.
 package invoice
 
 import (
@@ -43,6 +45,19 @@ const (
 	StatusConfirmed = "confirmed"
 	StatusExpired   = "expired"
 	StatusCancelled = "cancelled"
+
+	// StatusRejected is a Phase 1b addition (see internal/eventwatcher's status-
+	// mapping doc comment for the full rationale): it means the wallet's own
+	// transaction-event stream reported a non-mined-confirmed, non-in-flight
+	// terminal status (e.g. TRANSACTION_STATUS_REJECTED,
+	// TRANSACTION_STATUS_NOT_FOUND) for this invoice's payment_id — the chain
+	// rejected/lost the transaction, as opposed to StatusCancelled, which means
+	// the merchant/customer explicitly cancelled the invoice before any payment
+	// was ever detected. Overloading StatusCancelled for both cases would make it
+	// impossible to tell "customer never paid, we gave up" apart from "customer's
+	// payment was rejected by the chain" from the status column alone, so this is
+	// kept as its own value per the task brief's explicit instruction.
+	StatusRejected = "rejected"
 )
 
 // ResolveAddressFunc resolves a payment ID to a wallet payment address. In production
@@ -151,6 +166,48 @@ func (s *Store) ExpireStale(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("invoice: expire stale: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// List returns invoices ordered newest-first, optionally filtered to a single status
+// (status == "" means no filter) and optionally capped to the most recent limit rows
+// (limit <= 0 means no LIMIT clause). Added in Phase 1b for the HTMX admin UI's
+// dashboard ("recent invoices, last 20") and /admin/invoices ("full invoice list,
+// filterable by status") views — the only two Phase 1b callers, per this package's own
+// doc comment about not growing its surface ahead of actual need.
+func (s *Store) List(ctx context.Context, status string, limit int) ([]*Invoice, error) {
+	query := `
+		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at
+		FROM invoices
+	`
+	var args []any
+	if status != "" {
+		query += fmt.Sprintf(" WHERE status = $%d", len(args)+1)
+		args = append(args, status)
+	}
+	query += " ORDER BY created_at DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("invoice: list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Invoice
+	for rows.Next() {
+		inv, err := scanInvoice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("invoice: list: rows: %w", err)
+	}
+	return out, nil
 }
 
 // rowScanner is the subset of pgx.Row's interface scanInvoice needs — satisfied by

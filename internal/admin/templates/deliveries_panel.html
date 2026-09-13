@@ -1,0 +1,39 @@
+{{define "deliveries"}}
+<div id="webhook-deliveries" class="panel">
+    <h3>Recent Webhook Deliveries</h3>
+    {{if .Flash}}
+    <div class="flash-message {{if .FlashIsError}}error{{else}}success{{end}}">{{.Flash}}</div>
+    {{end}}
+    {{if not .Deliveries}}
+    <p class="empty-note">No webhook deliveries recorded yet.</p>
+    {{else}}
+    <table>
+        <thead>
+        <tr><th>Created</th><th>Invoice</th><th>Status</th><th>Attempts</th><th>Response</th><th>Last Error</th><th></th></tr>
+        </thead>
+        <tbody>
+        {{range .Deliveries}}
+        <tr>
+            <td>{{.CreatedAtDisplay}}</td>
+            <td><a href="/admin/invoices?status=">{{.InvoiceID}}</a></td>
+            <td>{{.Status}}</td>
+            <td>{{.Attempts}}</td>
+            <td>{{.ResponseCodeDisplay}}</td>
+            <td>{{.LastErrorDisplay}}</td>
+            <td>
+                {{if .IsFailed}}
+                <button hx-post="/admin/webhooks/{{.ID}}/retry"
+                        hx-target="#webhook-deliveries"
+                        hx-swap="outerHTML"
+                        hx-confirm="Retry this webhook delivery?">
+                    Retry
+                </button>
+                {{end}}
+            </td>
+        </tr>
+        {{end}}
+        </tbody>
+    </table>
+    {{end}}
+</div>
+{{end}}

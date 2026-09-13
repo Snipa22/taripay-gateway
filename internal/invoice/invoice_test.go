@@ -34,7 +34,7 @@ func setupStore(t *testing.T, resolveAddress ResolveAddressFunc) *Store {
 	t.Cleanup(pool.Close)
 
 	database := &db.DB{Pool: pool}
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, invoices CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
 		t.Fatalf("cleanup before test: %v", err)
 	}
 	if err := database.Migrate(ctx); err != nil {

@@ -1,0 +1,53 @@
+{{define "content"}}
+<h2>Dashboard</h2>
+
+{{if .WalletError}}
+<p class="error-note">{{.WalletError}}</p>
+{{else}}
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="label">Wallet Public Address</div>
+        <div class="value" style="font-size: 0.9rem;">{{.Identity.PublicAddress}}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Available Balance (uT)</div>
+        <div class="value">{{.Balance.AvailableBalance}}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Pending Incoming (uT)</div>
+        <div class="value">{{.Balance.PendingIncomingBalance}}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Pending Outgoing (uT)</div>
+        <div class="value">{{.Balance.PendingOutgoingBalance}}</div>
+    </div>
+</div>
+{{end}}
+
+<div class="panel">
+    <h3>Recent Invoices</h3>
+    {{if not .Invoices}}
+    <p class="empty-note">No invoices yet.</p>
+    {{else}}
+    <table>
+        <thead>
+        <tr><th>Created</th><th>Order Ref</th><th>Amount (uT)</th><th>Status</th><th>Payment ID</th></tr>
+        </thead>
+        <tbody>
+        {{range .Invoices}}
+        <tr>
+            <td>{{.CreatedAtDisplay}}</td>
+            <td>{{.OrderRef}}</td>
+            <td>{{.AmountUTari}}</td>
+            <td>{{.Status}}</td>
+            <td>{{.PaymentID}}</td>
+        </tr>
+        {{end}}
+        </tbody>
+    </table>
+    <p><a href="/admin/invoices">View all invoices &raquo;</a></p>
+    {{end}}
+</div>
+
+{{template "deliveries" .}}
+{{end}}

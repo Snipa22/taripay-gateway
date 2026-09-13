@@ -68,7 +68,7 @@ func TestMigrate_UpThenDownAgainstRealPostgres(t *testing.T) {
 
 	// Start from a clean slate so this test is repeatable against a persistent
 	// dev/test Postgres instance, not just a throwaway one.
-	if _, err := database.Pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, invoices CASCADE`); err != nil {
+	if _, err := database.Pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
 		t.Fatalf("cleanup before test: %v", err)
 	}
 

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TariPay Gateway Admin</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        body { font-family: monospace; margin: 2rem; background: #0f0f12; color: #e6e6e6; }
+        a { color: #7cc7ff; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { text-align: left; padding: 0.4rem 0.8rem; border-bottom: 1px solid #333; }
+        th { color: #999; }
+        button { background: #222; color: #e6e6e6; border: 1px solid #444; padding: 0.4rem 0.8rem; cursor: pointer; }
+        button:hover { background: #333; }
+        nav { margin-bottom: 1rem; color: #999; }
+        nav a { margin-right: 0.8rem; }
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+        .stat-card { border: 1px solid #333; padding: 1rem; background: #17171b; }
+        .stat-card .label { color: #999; font-size: 0.85rem; }
+        .stat-card .value { font-size: 1.4rem; color: #7fffa0; }
+        .panel { margin: 1.5rem 0; }
+        .panel h3 { color: #999; font-size: 0.9rem; text-transform: uppercase; margin-bottom: 0.5rem; }
+        .error-note { color: #ff8080; }
+        .empty-note { color: #888; }
+        .status-filters { margin: 0.5rem 0 1rem 0; }
+        .status-filters a { margin-right: 0.6rem; }
+        .flash-message { padding: 0.7rem 1rem; margin: 1rem 0; border: 1px solid #444; }
+        .flash-message.success { border-color: #3f8f5f; background: #142418; color: #7fffa0; }
+        .flash-message.error { border-color: #8f3f3f; background: #241414; color: #ff8080; }
+    </style>
+</head>
+<body>
+<h1><a href="/admin">TariPay Gateway Admin</a></h1>
+<nav>
+    <a href="/admin">Dashboard</a> | <a href="/admin/invoices">Invoices</a>
+</nav>
+{{block "content" .}}{{end}}
+</body>
+</html>

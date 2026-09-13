@@ -136,6 +136,64 @@ func TestLoad_InvalidIntEnvVarErrors(t *testing.T) {
 	}
 }
 
+// TestLoad_WebhookFieldsDefaultToEmpty covers Phase 1b's WebhookCallbackURL/
+// WebhookHMACSecret fields: absent any flag/env/file override, both must resolve to
+// "" (no default) WITHOUT Load() erroring — unlike PostgresDSN, these are allowed to
+// be unset; cmd/gateway (not this package) is responsible for warning about it.
+func TestLoad_WebhookFieldsDefaultToEmpty(t *testing.T) {
+	cfg, err := Load(Flags{PostgresDSN: "postgres://example/db"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WebhookCallbackURL != "" {
+		t.Errorf("WebhookCallbackURL = %q, want empty", cfg.WebhookCallbackURL)
+	}
+	if cfg.WebhookHMACSecret != "" {
+		t.Errorf("WebhookHMACSecret = %q, want empty", cfg.WebhookHMACSecret)
+	}
+}
+
+// TestLoad_WebhookFieldsFromEnv covers TARIPAY_WEBHOOK_CALLBACK_URL/
+// TARIPAY_WEBHOOK_HMAC_SECRET overriding the (empty) default.
+func TestLoad_WebhookFieldsFromEnv(t *testing.T) {
+	t.Setenv(envWebhookCallbackURL, "https://merchant.example/webhooks/taripay")
+	t.Setenv(envWebhookHMACSecret, "super-secret-value")
+
+	cfg, err := Load(Flags{PostgresDSN: "postgres://example/db"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WebhookCallbackURL != "https://merchant.example/webhooks/taripay" {
+		t.Errorf("WebhookCallbackURL = %q, want env value", cfg.WebhookCallbackURL)
+	}
+	if cfg.WebhookHMACSecret != "super-secret-value" {
+		t.Errorf("WebhookHMACSecret = %q, want env value", cfg.WebhookHMACSecret)
+	}
+}
+
+// TestLoad_WebhookFieldsFlagOverridesEnv covers the flag > env precedence for these
+// two fields specifically (the shared TestLoad_PrecedenceFlagOverEnvOverFileOverDefault
+// above only exercises PostgresDSN).
+func TestLoad_WebhookFieldsFlagOverridesEnv(t *testing.T) {
+	t.Setenv(envWebhookCallbackURL, "https://env.example/webhooks")
+	t.Setenv(envWebhookHMACSecret, "env-secret")
+
+	cfg, err := Load(Flags{
+		PostgresDSN:        "postgres://example/db",
+		WebhookCallbackURL: "https://flag.example/webhooks",
+		WebhookHMACSecret:  "flag-secret",
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WebhookCallbackURL != "https://flag.example/webhooks" {
+		t.Errorf("WebhookCallbackURL = %q, want flag value", cfg.WebhookCallbackURL)
+	}
+	if cfg.WebhookHMACSecret != "flag-secret" {
+		t.Errorf("WebhookHMACSecret = %q, want flag value", cfg.WebhookHMACSecret)
+	}
+}
+
 // writeTempConfig writes contents to a temp TOML file and returns its path.
 func writeTempConfig(t *testing.T, contents string) string {
 	t.Helper()
