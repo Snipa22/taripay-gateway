@@ -55,6 +55,7 @@ const (
 	envInvoiceTTLMinutes  = "TARIPAY_INVOICE_TTL_MINUTES"
 	envWebhookCallbackURL = "TARIPAY_WEBHOOK_CALLBACK_URL"
 	envWebhookHMACSecret  = "TARIPAY_WEBHOOK_HMAC_SECRET"
+	envAdminAuthToken     = "TARIPAY_ADMIN_AUTH_TOKEN"
 )
 
 // Config is the fully-resolved, ready-to-use configuration.
@@ -64,6 +65,15 @@ const (
 // creation/lookup must keep working standalone even if the merchant hasn't wired up
 // webhook delivery yet. cmd/gateway is responsible for logging a warning (not
 // failing startup) when either is empty, per the task brief.
+//
+// AdminAuthToken (the S1/I19 admin-auth fix) also has no default and is also not a
+// hard Load()-time error when unset — but it is treated more strictly than
+// WebhookCallbackURL/WebhookHMACSecret at the cmd/gateway call site: an unset
+// AdminAuthToken means the admin routes (/admin, /admin/invoices,
+// /admin/webhooks/{id}/retry) must not be registered on the mux AT ALL (so they 404
+// rather than silently running unauthenticated), not just "warn and keep going" like
+// the webhook fields. See cmd/gateway/main.go's admin-route wiring for that
+// enforcement; this package only resolves the value.
 type Config struct {
 	WalletGRPCAddress  string
 	PostgresDSN        string
@@ -72,6 +82,7 @@ type Config struct {
 	InvoiceTTLMinutes  int
 	WebhookCallbackURL string
 	WebhookHMACSecret  string
+	AdminAuthToken     string
 }
 
 // Flags holds every CLI-flag-shaped override this package accepts. Callers (cmd/*
@@ -92,6 +103,7 @@ type Flags struct {
 	InvoiceTTLMinutes  *int
 	WebhookCallbackURL string
 	WebhookHMACSecret  string
+	AdminAuthToken     string
 }
 
 // fileConfig is the raw shape decoded from an optional TOML config file. A config file
@@ -106,6 +118,7 @@ type fileConfig struct {
 	InvoiceTTLMinutes  *int   `toml:"invoice_ttl_minutes"`
 	WebhookCallbackURL string `toml:"webhook_callback_url"`
 	WebhookHMACSecret  string `toml:"webhook_hmac_secret"`
+	AdminAuthToken     string `toml:"admin_auth_token"`
 }
 
 // Load resolves a Config from flags, env vars, an optional TOML config file, and this
@@ -158,6 +171,12 @@ func Load(flags Flags) (*Config, error) {
 	webhookCallbackURL := firstNonEmpty(flags.WebhookCallbackURL, os.Getenv(envWebhookCallbackURL), file.WebhookCallbackURL)
 	webhookHMACSecret := firstNonEmpty(flags.WebhookHMACSecret, os.Getenv(envWebhookHMACSecret), file.WebhookHMACSecret)
 
+	// AdminAuthToken: same "no default, not a hard Load()-time error" treatment
+	// as the webhook fields above — see this package's Config doc comment for
+	// why cmd/gateway (not this package) enforces the stricter
+	// "don't register the admin routes at all if unset" behavior.
+	adminAuthToken := firstNonEmpty(flags.AdminAuthToken, os.Getenv(envAdminAuthToken), file.AdminAuthToken)
+
 	return &Config{
 		WalletGRPCAddress:  walletAddr,
 		PostgresDSN:        postgresDSN,
@@ -166,6 +185,7 @@ func Load(flags Flags) (*Config, error) {
 		InvoiceTTLMinutes:  invoiceTTLMinutes,
 		WebhookCallbackURL: webhookCallbackURL,
 		WebhookHMACSecret:  webhookHMACSecret,
+		AdminAuthToken:     adminAuthToken,
 	}, nil
 }
 

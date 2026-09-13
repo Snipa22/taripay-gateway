@@ -14,8 +14,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+
+	"github.com/Snipa22/taripay-gateway/internal/admin"
 	"github.com/Snipa22/taripay-gateway/internal/db"
 	"github.com/Snipa22/taripay-gateway/internal/invoice"
+	"github.com/Snipa22/taripay-gateway/internal/webhook"
 )
 
 // setupTestServer connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema, and
@@ -209,5 +213,122 @@ func TestGetInvoice_InvalidID(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// ---- registerAdminRoutes tests (S1/I19 admin-auth fix, task brief "fix C2 and add
+// auth", part 2) ----
+
+// setupAdminServer connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema,
+// and returns a fully-wired *admin.Server backed by fake wallet identify/balance
+// funcs and a fake webhook sender — same DI convention as internal/admin's own test
+// helper. Skips the calling test if no live Postgres DSN is configured.
+func setupAdminServer(t *testing.T) *admin.Server {
+	t.Helper()
+	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("SKIP: TARIPAY_TEST_POSTGRES_DSN not set, no live Postgres to test against")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	database := &db.DB{Pool: pool}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS schema_migrations, webhook_deliveries, invoices CASCADE`); err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	invoiceStore := invoice.NewStore(pool, func(paymentID string) (string, error) {
+		return "fake-address-for-" + paymentID, nil
+	})
+	webhookStore := webhook.NewStore(pool)
+	fakeSender := &fakeWebhookSender{}
+	identify := func() (*tari_generated.GetIdentityResponse, error) {
+		return &tari_generated.GetIdentityResponse{PublicAddress: "fake-wallet-address"}, nil
+	}
+	getBalances := func() (*tari_generated.GetBalanceResponse, error) {
+		return &tari_generated.GetBalanceResponse{AvailableBalance: 0}, nil
+	}
+
+	adminServer, err := admin.New(invoiceStore, webhookStore, fakeSender, identify, getBalances)
+	if err != nil {
+		t.Fatalf("admin.New() error = %v", err)
+	}
+	return adminServer
+}
+
+// fakeWebhookSender never performs real HTTP requests — these tests only exercise
+// route registration/auth-gating, never actual webhook delivery.
+type fakeWebhookSender struct{}
+
+func (f *fakeWebhookSender) Send(ctx context.Context, callbackURL string, payload []byte) (int, error) {
+	return 200, nil
+}
+
+// TestRegisterAdminRoutes_UnsetTokenDoesNotRegisterRoutes confirms that
+// registerAdminRoutes, called with an empty authToken (i.e. TARIPAY_ADMIN_AUTH_TOKEN
+// unset per config.Config.AdminAuthToken's doc comment), does not register the admin
+// routes on the mux AT ALL — a request to /admin must 404 (route not found), NOT 401
+// (which would imply the route exists but auth failed). This is the meaningfully
+// different, intentional signal the task brief calls for when the operator forgot to
+// configure admin auth.
+func TestRegisterAdminRoutes_UnsetTokenDoesNotRegisterRoutes(t *testing.T) {
+	adminServer := setupAdminServer(t)
+
+	mux := http.NewServeMux()
+	registerAdminRoutes(mux, adminServer, "")
+
+	for _, tc := range []struct {
+		method string
+		target string
+	}{
+		{http.MethodGet, "/admin"},
+		{http.MethodGet, "/admin/invoices"},
+		{http.MethodPost, "/admin/webhooks/00000000-0000-0000-0000-000000000000/retry"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.target, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status = %d, want %d (route must not be registered at all when AdminAuthToken is unset)", tc.method, tc.target, rec.Code, http.StatusNotFound)
+		}
+	}
+}
+
+// TestRegisterAdminRoutes_SetTokenRegistersProtectedRoutes confirms the opposite:
+// when authToken is non-empty, the admin routes ARE registered, and reachable
+// (behind auth) — a request with no Authorization header gets 401 (route exists,
+// auth required), not 404.
+func TestRegisterAdminRoutes_SetTokenRegistersProtectedRoutes(t *testing.T) {
+	adminServer := setupAdminServer(t)
+
+	mux := http.NewServeMux()
+	registerAdminRoutes(mux, adminServer, "some-admin-token")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d (route must be registered and auth-gated when AdminAuthToken is set)", rec.Code, http.StatusUnauthorized)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Header.Set("Authorization", "Bearer some-admin-token")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d with the correct token, body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 }

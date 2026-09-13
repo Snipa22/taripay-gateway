@@ -51,6 +51,12 @@ USER nonroot:nonroot
 # (see internal/config/config.go) unless overridden by flag/env/config file at
 # runtime. EXPOSE below documents that default without hardcoding a redefinition
 # of it here.
+#
+# TARIPAY_ADMIN_AUTH_TOKEN has no default at all (not even a placeholder) and MUST be
+# set for the admin UI (/admin, /admin/invoices, /admin/webhooks/*/retry) to be
+# reachable — if unset, cmd/gateway logs a startup warning and does not register
+# those routes on the mux (they 404), per the S1/I19 admin-auth fix. The
+# merchant-facing /invoice API is unaffected either way.
 EXPOSE 8090
 
 ENTRYPOINT ["/usr/local/bin/gateway"]

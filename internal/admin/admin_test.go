@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -83,6 +84,21 @@ func (f *fakeSender) Send(ctx context.Context, callbackURL string, payload []byt
 	return f.statusCode, f.err
 }
 
+// testAdminAuthToken is the shared bearer token used throughout this test file's
+// RegisterRoutes calls — arbitrary, but non-empty (an empty token is itself covered
+// separately, see requireAuth's fail-closed behavior tested in auth_test.go... no,
+// actually tested below in this file via TestRequireAuth_*).
+const testAdminAuthToken = "test-admin-token-do-not-use-in-prod"
+
+// authedRequest builds an httptest.Request with a valid Authorization: Bearer header
+// for testAdminAuthToken, for tests exercising handler behavior rather than the auth
+// middleware itself.
+func authedRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", "Bearer "+testAdminAuthToken)
+	return req
+}
+
 func TestHandleDashboard_RendersExpectedContent(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
 	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
@@ -97,9 +113,9 @@ func TestHandleDashboard_RendersExpectedContent(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	srv.RegisterRoutes(mux)
+	srv.RegisterRoutes(mux, testAdminAuthToken)
 
-	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req := authedRequest(http.MethodGet, "/admin", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -123,9 +139,9 @@ func TestHandleDashboard_WalletErrorDegradesGracefully(t *testing.T) {
 	srv, _, _ := setupServer(t, sender, identify, nil)
 
 	mux := http.NewServeMux()
-	srv.RegisterRoutes(mux)
+	srv.RegisterRoutes(mux, testAdminAuthToken)
 
-	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req := authedRequest(http.MethodGet, "/admin", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -156,9 +172,9 @@ func TestHandleInvoices_FiltersByStatus(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	srv.RegisterRoutes(mux)
+	srv.RegisterRoutes(mux, testAdminAuthToken)
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/invoices?status=confirmed", nil)
+	req := authedRequest(http.MethodGet, "/admin/invoices?status=confirmed", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -194,9 +210,9 @@ func TestHandleWebhookRetry_CallsSenderAndUpdatesRecord(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	srv.RegisterRoutes(mux)
+	srv.RegisterRoutes(mux, testAdminAuthToken)
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/webhooks/"+delivery.ID.String()+"/retry", nil)
+	req := authedRequest(http.MethodPost, "/admin/webhooks/"+delivery.ID.String()+"/retry", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -228,13 +244,206 @@ func TestHandleWebhookRetry_UnknownIDReturns404(t *testing.T) {
 	srv, _, _ := setupServer(t, sender, nil, nil)
 
 	mux := http.NewServeMux()
-	srv.RegisterRoutes(mux)
+	srv.RegisterRoutes(mux, testAdminAuthToken)
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/webhooks/00000000-0000-0000-0000-000000000000/retry", nil)
+	req := authedRequest(http.MethodPost, "/admin/webhooks/00000000-0000-0000-0000-000000000000/retry", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// ---- auth tests (S1/I19 admin-auth fix, task brief "fix C2 and add auth", part 2)
+// ----
+
+// adminRouteTestCases enumerates every admin route this fix must protect, per the
+// brief's explicit "confirm the retry route specifically still requires auth" and
+// "EACH admin route" instructions.
+func adminRouteTestCases() []struct {
+	name   string
+	method string
+	target string
+} {
+	return []struct {
+		name   string
+		method string
+		target string
+	}{
+		{"dashboard", http.MethodGet, "/admin"},
+		{"invoices list", http.MethodGet, "/admin/invoices"},
+		{"webhook retry", http.MethodPost, "/admin/webhooks/00000000-0000-0000-0000-000000000000/retry"},
+	}
+}
+
+// TestRequireAuth_MissingHeaderReturns401 covers every admin route with no
+// Authorization header at all.
+func TestRequireAuth_MissingHeaderReturns401(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, _, _ := setupServer(t, sender, nil, nil)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	for _, tc := range adminRouteTestCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d (no Authorization header)", rec.Code, http.StatusUnauthorized)
+			}
+			if rec.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("WWW-Authenticate header missing on 401 response")
+			}
+		})
+	}
+}
+
+// TestRequireAuth_WrongTokenReturns401 covers every admin route with a
+// well-formed but incorrect bearer token.
+func TestRequireAuth_WrongTokenReturns401(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, _, _ := setupServer(t, sender, nil, nil)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	for _, tc := range adminRouteTestCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			req.Header.Set("Authorization", "Bearer wrong-token")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d (wrong token)", rec.Code, http.StatusUnauthorized)
+			}
+			if rec.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("WWW-Authenticate header missing on 401 response")
+			}
+		})
+	}
+}
+
+// TestRequireAuth_CorrectTokenReachesHandler covers every admin route with the
+// correct bearer token, confirming the request reaches the real handler (i.e. never
+// a 401) — for the retry route specifically this also confirms the sender was
+// actually invoked, not just that some 2xx/404 status was returned.
+func TestRequireAuth_CorrectTokenReachesHandler(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-auth-retry", 100, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	delivery, err := webhookStore.Create(ctx, inv.ID, "https://merchant.example/webhook", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+	if err := webhookStore.MarkFailed(ctx, delivery.ID, nil, "initial failure"); err != nil {
+		t.Fatalf("seed failed delivery: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	for _, tc := range []struct {
+		name       string
+		method     string
+		target     string
+		wantStatus int
+	}{
+		{"dashboard", http.MethodGet, "/admin", http.StatusOK},
+		{"invoices list", http.MethodGet, "/admin/invoices", http.StatusOK},
+		{"webhook retry", http.MethodPost, "/admin/webhooks/" + delivery.ID.String() + "/retry", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := authedRequest(tc.method, tc.target, nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (correct token must reach the real handler), body: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+
+	if sender.calls != 1 {
+		t.Errorf("sender.calls = %d, want 1 (retry route with correct token must call through to the sender)", sender.calls)
+	}
+}
+
+// TestRequireAuth_RetryRouteSpecificallyRequiresAuth is a dedicated, narrowly-scoped
+// regression test for the retry POST route per the brief's explicit callout: "this
+// was the one people most likely to bypass in a quick fix". Verifies both that an
+// unauthenticated retry attempt is rejected AND that it never reaches the sender
+// (i.e. the auth check happens before any side effect, not just before the response
+// is written).
+func TestRequireAuth_RetryRouteSpecificallyRequiresAuth(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-retry-noauth", 100, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	delivery, err := webhookStore.Create(ctx, inv.ID, "https://merchant.example/webhook", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+	if err := webhookStore.MarkFailed(ctx, delivery.ID, nil, "initial failure"); err != nil {
+		t.Fatalf("seed failed delivery: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/webhooks/"+delivery.ID.String()+"/retry", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d (retry route without auth must be rejected)", rec.Code, http.StatusUnauthorized)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender.calls = %d, want 0 (retry must not reach the sender without valid auth)", sender.calls)
+	}
+
+	got, err := webhookStore.GetByID(ctx, delivery.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Attempts != 0 {
+		t.Errorf("Attempts = %d, want 0 (retry without auth must not increment attempts)", got.Attempts)
+	}
+}
+
+// TestRequireAuth_EmptyTokenAlwaysRejects covers requireAuth's fail-closed behavior:
+// an empty configured token must reject every request, even one with an empty
+// Authorization header/token, rather than treating "" == "" as a match. This is
+// defense-in-depth for a caller bug — cmd/gateway/main.go is expected to never call
+// RegisterRoutes with an empty token in the first place (see that function's own
+// "don't register admin routes at all if unset" logic), but this test ensures the
+// middleware itself doesn't silently open up if that invariant is ever violated.
+func TestRequireAuth_EmptyTokenAlwaysRejects(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, _, _ := setupServer(t, sender, nil, nil)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (empty configured token must always reject)", rec.Code, http.StatusUnauthorized)
 	}
 }

@@ -88,15 +88,26 @@ func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhoo
 }
 
 // RegisterRoutes registers every admin route (GET /admin, GET /admin/invoices, POST
-// /admin/webhooks/{id}/retry) onto mux. Taking an existing *http.ServeMux (rather than
-// this package owning/returning its own top-level http.Handler, like
-// go-tari-ootle-explorer's Server.Handler does) lets cmd/gateway/main.go compose this
-// package's routes with its existing POST /invoice and GET /invoice/{id} routes on one
-// mux, without either package needing to know about the other's route set.
-func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /admin", s.handleDashboard)
-	mux.HandleFunc("GET /admin/invoices", s.handleInvoices)
-	mux.HandleFunc("POST /admin/webhooks/{id}/retry", s.handleWebhookRetry)
+// /admin/webhooks/{id}/retry) onto mux, each wrapped in requireAuth(authToken, ...) —
+// the S1/I19 admin-auth fix (task brief "fix C2 and add auth", part 2). Every admin
+// route goes through this same wrapping, with no exceptions (including the retry
+// POST route, which is the one most likely to get missed in a quick fix).
+//
+// Taking an existing *http.ServeMux (rather than this package owning/returning its
+// own top-level http.Handler, like go-tari-ootle-explorer's Server.Handler does) lets
+// cmd/gateway/main.go compose this package's routes with its existing POST /invoice
+// and GET /invoice/{id} routes on one mux, without either package needing to know
+// about the other's route set.
+//
+// Callers are responsible for the "don't register admin routes at all if authToken is
+// unconfigured" decision (per this repo's internal/config.Config.AdminAuthToken doc
+// comment) — RegisterRoutes itself has no opinion on whether it should have been
+// called; cmd/gateway/main.go is where that check lives, since that's where the
+// resolved config (and thus the loud startup warning) is available.
+func (s *Server) RegisterRoutes(mux *http.ServeMux, authToken string) {
+	mux.Handle("GET /admin", requireAuth(authToken, http.HandlerFunc(s.handleDashboard)))
+	mux.Handle("GET /admin/invoices", requireAuth(authToken, http.HandlerFunc(s.handleInvoices)))
+	mux.Handle("POST /admin/webhooks/{id}/retry", requireAuth(authToken, http.HandlerFunc(s.handleWebhookRetry)))
 }
 
 // ---- view adapters (presentation-only, keep invoice/webhook packages free of display
