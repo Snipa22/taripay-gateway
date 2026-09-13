@@ -1,9 +1,11 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -150,6 +152,80 @@ func TestHandleDashboard_WalletErrorDegradesGracefully(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "unable to reach wallet") {
 		t.Errorf("dashboard body missing wallet error note, body:\n%s", rec.Body.String())
+	}
+}
+
+// captureLog redirects the standard logger's output to an in-memory buffer for the
+// duration of the calling test (restored via t.Cleanup) — used by
+// TestHandleDashboard_WalletErrorDoesNotLeakDetail below to assert that the
+// degraded-dashboard path still logs the real wallet error detail server-side, per
+// the task brief's explicit "assert on the log output in the test, not just the
+// response body" requirement.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prevOutput := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		log.SetOutput(prevOutput)
+	})
+	return &buf
+}
+
+// TestHandleDashboard_WalletErrorDoesNotLeakDetail covers the dashboard-
+// degradation path's generic-error fix (task brief part 3, I4 security-
+// boundaries persona): the rendered page must not contain a fake-but-realistic
+// wallet gRPC dial address from the underlying error, while the full detail is
+// still logged server-side alongside a correlation id that also appears on the
+// rendered page.
+func TestHandleDashboard_WalletErrorDoesNotLeakDetail(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	sensitiveDetail := "rpc error: code = Unavailable desc = connection error: dial tcp 10.0.0.5:18143: connect: connection refused"
+	identify := func() (*tari_generated.GetIdentityResponse, error) {
+		return nil, errors.New(sensitiveDetail)
+	}
+	srv, _, _ := setupServer(t, sender, identify, nil)
+	logBuf := captureLog(t)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodGet, "/admin", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (wallet error should degrade, not 500)", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "10.0.0.5") || strings.Contains(body, "dial tcp") {
+		t.Errorf("dashboard body leaks internal wallet gRPC dial detail:\n%s", body)
+	}
+	if !strings.Contains(body, "unable to reach wallet") {
+		t.Errorf("dashboard body missing the generic wallet error note, body:\n%s", body)
+	}
+
+	// Extract the correlation id the generic message embeds (format:
+	// "correlation_id: <uuid>)") to confirm it also appears in the server log
+	// alongside the real error detail.
+	const marker = "correlation_id: "
+	idx := strings.Index(body, marker)
+	if idx == -1 {
+		t.Fatalf("dashboard body missing a correlation_id, body:\n%s", body)
+	}
+	rest := body[idx+len(marker):]
+	end := strings.IndexAny(rest, ")<")
+	if end == -1 {
+		t.Fatalf("could not find end of correlation_id in body:\n%s", body)
+	}
+	correlationID := rest[:end]
+
+	if !strings.Contains(logBuf.String(), sensitiveDetail) {
+		t.Errorf("server log missing the full wallet error detail, log:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), correlationID) {
+		t.Errorf("server log missing the correlation id %q rendered on the dashboard, log:\n%s", correlationID, logBuf.String())
 	}
 }
 
