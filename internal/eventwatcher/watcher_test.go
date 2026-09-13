@@ -630,6 +630,62 @@ func TestRun_TerminalStatusGuard_RejectedIgnoresLaterConfirmedEvent(t *testing.T
 	}
 }
 
+// TestUpdateStatusAndCreateDelivery_AtomicRollbackOnDeliveryFailure proves the
+// webhook-delivery-reliability fix (task brief part 2, item 1) is actually atomic —
+// not just "both steps sequentially attempted" — by forcing the delivery-row-creation
+// step to fail (a deliberately malformed payload that fails webhook_deliveries'
+// payload::jsonb cast) and confirming the invoice's status update was ALSO rolled
+// back, not left committed.
+func TestUpdateStatusAndCreateDelivery_AtomicRollbackOnDeliveryFailure(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-atomic-rollback", 1000, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	if inv.Status != invoice.StatusPending {
+		t.Fatalf("precondition: invoice.Status = %q, want %q", inv.Status, invoice.StatusPending)
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	now := time.Now().UTC()
+	// Deliberately malformed JSON: webhook_deliveries.payload is a jsonb column, and
+	// createDelivery's INSERT casts the payload string via an explicit ::jsonb cast
+	// — invalid JSON makes that cast fail inside the SAME transaction as the
+	// invoice UPDATE that ran just before it, exercising exactly the failure mode
+	// this fix guards against (a delivery-row-creation failure after the status
+	// update would otherwise already have committed).
+	_, err = w.updateStatusAndCreateDelivery(ctx, inv.ID, invoice.StatusConfirmed, &now, []byte("this is not valid json"))
+	if err == nil {
+		t.Fatal("updateStatusAndCreateDelivery() error = nil, want a non-nil error from the malformed-payload delivery-row insert")
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want %q (the failed delivery-row insert must have rolled back the status update too — not just been sequentially attempted)", got.Status, invoice.StatusPending)
+	}
+	if got.ConfirmedAt != nil {
+		t.Errorf("ConfirmedAt = %v, want nil (status update must have been rolled back)", got.ConfirmedAt)
+	}
+
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 0 {
+		t.Errorf("len(deliveries) = %d, want 0 (the failed insert must not have left a partial delivery row either)", len(deliveries))
+	}
+	if spy.callCount() != 0 {
+		t.Errorf("spy.callCount() = %d, want 0 (Attempt/Send must never be reached when the atomic commit itself failed)", spy.callCount())
+	}
+}
+
 // TestRun_StreamErrorIsReturned verifies a non-nil error from the error channel is
 // logged and returned as-is (no retry logic inside Run itself).
 func TestRun_StreamErrorIsReturned(t *testing.T) {

@@ -7,9 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 
@@ -299,30 +302,35 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 		}
 	}
 
-	if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
-		log.Printf("eventwatcher: update status for invoice %s to %q: %v", inv.ID, newStatus, err)
-		return
-	}
-
 	if previousStatus == newStatus {
 		// No actual transition (e.g. a repeat MINED_CONFIRMED event for an
-		// already-confirmed invoice) — UpdateStatus above is harmless/idempotent,
-		// but do NOT refire a webhook for it. This guard applies uniformly to
-		// StatusUnderpaid too (per the task brief): if the same transaction is
-		// somehow re-processed while the invoice is already underpaid, no
-		// duplicate payment.underpaid webhook fires either.
+		// already-confirmed invoice) — UpdateStatus is harmless/idempotent, but
+		// do NOT refire a webhook for it, and no delivery row is needed, so no
+		// atomicity concern here. This guard applies uniformly to StatusUnderpaid
+		// too (per the task brief): if the same transaction is somehow
+		// re-processed while the invoice is already underpaid, no duplicate
+		// payment.underpaid webhook fires either.
+		if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
+			log.Printf("eventwatcher: update status for invoice %s to %q: %v", inv.ID, newStatus, err)
+		}
 		return
 	}
 
 	w.fireWebhook(ctx, inv, newStatus, webhookEvent, txn, confirmedAt, amountReceived)
 }
 
-// fireWebhook builds the webhook payload for a status transition, records a pending
-// delivery row, and attempts delivery. If callbackURL is unconfigured, it logs and
-// skips delivery entirely (invoice status has already been updated regardless).
+// fireWebhook handles an actual status transition (previousStatus != newStatus,
+// already established by handleEvent): if no webhook callback URL is configured, it
+// just performs the plain invoice.Store.UpdateStatus (no delivery row is needed at
+// all in that case — see NewWatcher's doc comment). Otherwise it atomically commits
+// the status update together with a new pending delivery row (task brief part 2,
+// item 1 — see updateStatusAndCreateDelivery), then attempts delivery.
 func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStatus, webhookEvent string, txn *tari_generated.TransactionEvent, confirmedAt *time.Time, amountReceived uint64) {
 	if w.callbackURL == "" {
 		log.Printf("eventwatcher: webhook callback URL not configured, skipping webhook for invoice %s (event=%s)", inv.ID, webhookEvent)
+		if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
+			log.Printf("eventwatcher: update status for invoice %s to %q: %v", inv.ID, newStatus, err)
+		}
 		return
 	}
 
@@ -342,17 +350,73 @@ func (w *Watcher) fireWebhook(ctx context.Context, inv *invoice.Invoice, newStat
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("eventwatcher: marshal webhook payload for invoice %s: %v", inv.ID, err)
+		// json.Marshal of this fixed, simple struct essentially never fails in
+		// practice, but if it somehow does, fall back to a plain (non-atomic)
+		// status update rather than losing the transition entirely — there is
+		// no payload to create a delivery row with anyway, so atomicity with a
+		// delivery row is moot here.
+		log.Printf("eventwatcher: marshal webhook payload for invoice %s: %v (status update proceeding without a webhook)", inv.ID, err)
+		if err := w.invoiceStore.UpdateStatus(ctx, inv.ID, newStatus, confirmedAt); err != nil {
+			log.Printf("eventwatcher: update status for invoice %s to %q: %v", inv.ID, newStatus, err)
+		}
 		return
 	}
 
-	delivery, err := w.webhookStore.Create(ctx, inv.ID, w.callbackURL, body)
+	delivery, err := w.updateStatusAndCreateDelivery(ctx, inv.ID, newStatus, confirmedAt, body)
 	if err != nil {
-		log.Printf("eventwatcher: create webhook delivery row for invoice %s: %v", inv.ID, err)
+		log.Printf("eventwatcher: atomic status update + webhook delivery row creation for invoice %s: %v", inv.ID, err)
 		return
 	}
 
 	if err := webhook.Attempt(ctx, w.webhookStore, w.sender, delivery); err != nil {
 		log.Printf("eventwatcher: webhook delivery attempt bookkeeping for invoice %s: %v", inv.ID, err)
 	}
+}
+
+// updateStatusAndCreateDelivery is the webhook-delivery-reliability fix (task brief
+// part 2, item 1): it commits an invoice's status update and its corresponding
+// pending webhook-delivery row in a SINGLE database transaction, so it is impossible
+// for one to succeed without the other. Before this fix, w.invoiceStore.UpdateStatus
+// and w.webhookStore.Create were two independent statements — if Create failed after
+// UpdateStatus had already committed (e.g. a crash, or a transient DB blip between
+// the two calls), the invoice would have silently transitioned with NO delivery row
+// ever created for it, and thus nothing for RetryFailedDeliveries (task brief part 2,
+// item 2) to ever find and retry. Wrapping both writes in one pgx.Tx closes that
+// window entirely: either both the UPDATE and the INSERT commit, or neither does.
+//
+// This deliberately begins the transaction on w.invoiceStore.Pool() (see that
+// method's doc comment on why this only works because invoiceStore and webhookStore
+// are always constructed against the same underlying *pgxpool.Pool in this repo) —
+// there is no "transaction spanning two Stores" primitive in either package, and
+// building one felt like overkill for what is, underneath, one pool being asked for
+// one transaction that two different Store methods happen to write through.
+//
+// The delivery's actual HTTP send attempt (webhook.Attempt) deliberately happens
+// AFTER this function returns/commits, not inside the same transaction: Attempt does
+// its own separate, already-idempotent-enough bookkeeping writes (IncrementAttempts,
+// then MarkDelivered/MarkFailed), and a real outbound HTTP call has no business
+// holding a database transaction open around it.
+func (w *Watcher) updateStatusAndCreateDelivery(ctx context.Context, invoiceID uuid.UUID, newStatus string, confirmedAt *time.Time, payload []byte) (*webhook.Delivery, error) {
+	tx, err := w.invoiceStore.Pool().Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	// Rollback is a safe no-op if Commit below already succeeded (pgx.Tx.Rollback's
+	// own doc comment: safe to call multiple times / after a closed tx).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := w.invoiceStore.UpdateStatusTx(ctx, tx, invoiceID, newStatus, confirmedAt); err != nil {
+		return nil, fmt.Errorf("update status (tx): %w", err)
+	}
+
+	delivery, err := w.webhookStore.CreateTx(ctx, tx, invoiceID, w.callbackURL, payload)
+	if err != nil {
+		return nil, fmt.Errorf("create delivery row (tx): %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	return delivery, nil
 }
