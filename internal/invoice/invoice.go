@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -132,6 +133,21 @@ func NewStore(db *pgxpool.Pool, resolveAddress ResolveAddressFunc) *Store {
 	return &Store{db: db, resolveAddress: resolveAddress}
 }
 
+// Pool returns the underlying *pgxpool.Pool this Store is backed by. Exposed so
+// callers that need to compose a single atomic transaction spanning this Store and
+// another package's Store (concretely: internal/eventwatcher's
+// updateStatusAndCreateDelivery, spanning this package's UpdateStatusTx and
+// internal/webhook's Store.CreateTx — task brief part 2, item 1) can Begin a
+// transaction directly, rather than this package growing a bespoke
+// "transaction-spanning-two-Stores" API of its own. This only actually produces a
+// transaction spanning both Stores' writes if both were constructed against the same
+// underlying pool — true for every production and test call site in this repo (see
+// cmd/gateway/main.go and every setupStores-style test helper, which always pass the
+// same *pgxpool.Pool to both invoice.NewStore and webhook.NewStore).
+func (s *Store) Pool() *pgxpool.Pool {
+	return s.db
+}
+
 // Create generates a new invoice: a UUID (used as both the row's id and, as its
 // string form, the wallet payment_id — see the doc comment on that field below),
 // resolves a payment address for it via the injected resolveAddress func, and inserts
@@ -194,10 +210,17 @@ func (s *Store) GetByPaymentID(ctx context.Context, paymentID string) (*Invoice,
 	return scanInvoice(row)
 }
 
-// UpdateStatus sets an invoice's status (and, if non-nil, its confirmed_at) by id.
-// Returns ErrNotFound if no such invoice exists.
-func (s *Store) UpdateStatus(ctx context.Context, id uuid.UUID, status string, confirmedAt *time.Time) error {
-	tag, err := s.db.Exec(ctx, `
+// execer is the subset of *pgxpool.Pool's and pgx.Tx's identical Exec signature this
+// package needs — satisfied by both, so updateStatus below can run either as a
+// standalone statement against the pool (UpdateStatus) or as one statement inside a
+// caller-managed transaction (UpdateStatusTx), sharing the exact same SQL/error
+// handling either way.
+type execer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func updateStatus(ctx context.Context, db execer, id uuid.UUID, status string, confirmedAt *time.Time) error {
+	tag, err := db.Exec(ctx, `
 		UPDATE invoices SET status = $2, confirmed_at = $3 WHERE id = $1
 	`, id, status, confirmedAt)
 	if err != nil {
@@ -207,6 +230,25 @@ func (s *Store) UpdateStatus(ctx context.Context, id uuid.UUID, status string, c
 		return ErrNotFound
 	}
 	return nil
+}
+
+// UpdateStatus sets an invoice's status (and, if non-nil, its confirmed_at) by id.
+// Returns ErrNotFound if no such invoice exists.
+func (s *Store) UpdateStatus(ctx context.Context, id uuid.UUID, status string, confirmedAt *time.Time) error {
+	return updateStatus(ctx, s.db, id, status, confirmedAt)
+}
+
+// UpdateStatusTx is UpdateStatus run inside a caller-managed transaction tx instead of
+// against this Store's own pool directly. Added for the webhook-delivery-reliability
+// fix (task brief part 2, item 1): internal/eventwatcher's
+// updateStatusAndCreateDelivery composes this with webhook.Store.CreateTx inside one
+// pgx.Tx so the invoice status transition and its corresponding webhook delivery row
+// commit together or not at all — see that function's doc comment for the full
+// rationale. tx must have been started against the same underlying database this
+// Store's pool points at (true for every call site in this repo; see Store.Pool's doc
+// comment).
+func (s *Store) UpdateStatusTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, status string, confirmedAt *time.Time) error {
+	return updateStatus(ctx, tx, id, status, confirmedAt)
 }
 
 // AddReceivedAmount atomically increments an invoice's cumulative received-amount

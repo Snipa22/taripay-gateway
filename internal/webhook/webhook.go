@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -91,6 +92,33 @@ func NewStore(db *pgxpool.Pool) *Store {
 // Create inserts a new pending delivery row for invoiceID and returns the resulting
 // Delivery (id/status/attempts/created_at all populated as inserted).
 func (s *Store) Create(ctx context.Context, invoiceID uuid.UUID, callbackURL string, payload []byte) (*Delivery, error) {
+	return createDelivery(ctx, s.db, invoiceID, callbackURL, payload)
+}
+
+// CreateTx is Create run inside a caller-managed transaction tx instead of against
+// this Store's own pool directly. Added for the webhook-delivery-reliability fix
+// (task brief part 2, item 1): internal/eventwatcher's updateStatusAndCreateDelivery
+// composes this with invoice.Store.UpdateStatusTx inside one pgx.Tx so the invoice
+// status transition and its corresponding webhook delivery row commit together or
+// not at all — it must be impossible for the invoice to transition without a
+// corresponding delivery row existing (even a never-attempted one, for
+// RetryFailedDeliveries to eventually find). tx must have been started against the
+// same underlying database this Store's pool points at (true for every call site in
+// this repo; see invoice.Store.Pool's doc comment).
+func (s *Store) CreateTx(ctx context.Context, tx pgx.Tx, invoiceID uuid.UUID, callbackURL string, payload []byte) (*Delivery, error) {
+	return createDelivery(ctx, tx, invoiceID, callbackURL, payload)
+}
+
+// execer is the subset of *pgxpool.Pool's and pgx.Tx's identical Exec signature this
+// package needs — satisfied by both, so createDelivery below can run either as a
+// standalone statement against the pool (Create) or as one statement inside a
+// caller-managed transaction (CreateTx), sharing the exact same SQL/error handling
+// either way.
+type execer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func createDelivery(ctx context.Context, db execer, invoiceID uuid.UUID, callbackURL string, payload []byte) (*Delivery, error) {
 	d := &Delivery{
 		ID:          uuid.New(),
 		InvoiceID:   invoiceID,
@@ -106,7 +134,7 @@ func (s *Store) Create(ctx context.Context, invoiceID uuid.UUID, callbackURL str
 	// against a jsonb column (which otherwise risks being sent as bytea and
 	// rejected by Postgres) — string(payload) is safe here since payload is
 	// always valid UTF-8 JSON produced by json.Marshal in this package's callers.
-	_, err := s.db.Exec(ctx, `
+	_, err := db.Exec(ctx, `
 		INSERT INTO webhook_deliveries (id, invoice_id, callback_url, payload, status, attempts, created_at)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
 	`, d.ID, d.InvoiceID, d.CallbackURL, string(d.Payload), d.Status, d.Attempts, d.CreatedAt)
