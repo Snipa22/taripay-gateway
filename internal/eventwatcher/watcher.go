@@ -23,6 +23,39 @@ import (
 // ResolveAddressFunc.
 type EventSourceFunc func(ctx context.Context) (<-chan *tari_generated.TransactionEventResponse, <-chan error)
 
+// transactionEventDirectionInbound is the wire value tari_generated.TransactionEvent.Direction
+// (populated by StreamTransactionEvents) uses for an inbound payment: the short
+// form "Inbound".
+//
+// This is DELIBERATELY NOT the same as the long enum-name form
+// ("TRANSACTION_DIRECTION_INBOUND") that tari_generated.TransactionInfo.Direction
+// (a different generated struct, populated by GetCompletedTransactions /
+// GetBlockHeightTransactions) uses. Both fields represent "is this an inbound
+// payment?", and it looks like they should share a wire format, but they don't:
+//
+//   - TransactionEvent.Direction/Status are plain proto `string` fields, and
+//     minotari_console_wallet's gRPC server (applications/minotari_console_wallet/
+//     src/grpc/mod.rs's convert_to_transaction_event) populates them by calling
+//     `.to_string()` on the wallet's internal Rust TransactionDirection/
+//     LegacyTransactionStatus enums, whose Display impls emit short, human-readable
+//     forms ("Inbound", "Outbound"; "Mined Confirmed", "One-Sided Confirmed", etc.).
+//   - TransactionInfo.Direction/Status ARE real proto enums (TransactionDirection/
+//     TransactionStatus from wallet.proto), which protobuf/grpc serialize as their
+//     full enum-name form ("TRANSACTION_DIRECTION_INBOUND",
+//     "TRANSACTION_STATUS_MINED_CONFIRMED").
+//
+// Confirmed live on 2026-09-13 against a real minotari_console_wallet (Esmeralda
+// testnet): a genuine inbound one-sided payment made StreamTransactionEvents emit
+// direction: "Inbound", while GetCompletedTransactions for the SAME transaction
+// returned direction: "TRANSACTION_DIRECTION_INBOUND" on TransactionInfo. Also cross-
+// checked against minotari_console_wallet's own source
+// (base_layer/common_types/src/transaction.rs's `impl Display for
+// TransactionDirection`, which only ever emits "Inbound"/"Outbound"/"Unknown" — never
+// the TRANSACTION_DIRECTION_* form). Do NOT add the long form here: this specific
+// field/RPC never emits it, and doing so would just resurrect the confusion that
+// caused this bug.
+const transactionEventDirectionInbound = "Inbound"
+
 // Watcher consumes a wallet transaction-event stream and drives invoice status
 // updates + webhook delivery from it.
 type Watcher struct {
@@ -64,12 +97,35 @@ func NewWatcher(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender
 // consuming base-node chain height data this gateway doesn't have wired up in this
 // pass — see the task brief's explicit "don't build that in this pass" instruction.
 // config.ConfirmationDepth therefore remains unused/aspirational until that's built.
+//
+// IMPORTANT, LIVE-CONFIRMED 2026-09-13: unlike TransactionInfo.Status (from
+// GetCompletedTransactions/GetBlockHeightTransactions, which really does use the
+// long TRANSACTION_STATUS_* enum-name form, e.g. "TRANSACTION_STATUS_MINED_CONFIRMED"
+// — confirmed via grpcurl against a real minotari_console_wallet on Esmeralda
+// testnet), TransactionEvent.Status (this function's input, from
+// StreamTransactionEvents) is a plain proto `string` field, not an enum, and the
+// wallet daemon populates it with minotari_console_wallet's
+// LegacyTransactionStatus/TransactionStatus Display impl's human-readable, spaced
+// form instead: "Broadcast", "Pending", "Mined Unconfirmed", "Mined Confirmed",
+// "One-Sided Unconfirmed", "One-Sided Confirmed", "Rejected", etc. — confirmed live
+// by triggering real one-sided/self transactions against a real wallet and observing
+// StreamTransactionEvents emit e.g. status="One-Sided Unconfirmed" then
+// status="Mined Confirmed"/"One-Sided Confirmed" for the same transaction, and cross-
+// checked directly against minotari_console_wallet's own source
+// (base_layer/common_types/src/transaction.rs's `impl Display for
+// LegacyTransactionStatus`). The matching below is therefore done against the
+// space/hyphen-separated short form (case-insensitively, via an upper-cased
+// comparison, to tolerate any casing drift) — NOT the TRANSACTION_STATUS_* long form,
+// which this field never emits. Do not "fix" this back to underscore-separated
+// TRANSACTION_STATUS_* matching; that is TransactionInfo.Status's format, not this
+// one's.
 func mapStatus(status string) (invoiceStatus, webhookEvent string) {
+	upper := strings.ToUpper(status)
 	switch {
-	case strings.Contains(status, "MINED_CONFIRMED"), strings.Contains(status, "ONE_SIDED_CONFIRMED"):
+	case strings.Contains(upper, "MINED CONFIRMED"), strings.Contains(upper, "ONE-SIDED CONFIRMED"):
 		return invoice.StatusConfirmed, "payment.confirmed"
-	case strings.Contains(status, "BROADCAST"), strings.Contains(status, "PENDING"),
-		strings.Contains(status, "MINED_UNCONFIRMED"), strings.Contains(status, "ONE_SIDED_UNCONFIRMED"):
+	case strings.Contains(upper, "BROADCAST"), strings.Contains(upper, "PENDING"),
+		strings.Contains(upper, "MINED UNCONFIRMED"), strings.Contains(upper, "ONE-SIDED UNCONFIRMED"):
 		return invoice.StatusSeen, "payment.seen"
 	default:
 		// REJECTED, NOT_FOUND, or any other/unrecognized status: treat as a
@@ -139,7 +195,16 @@ func (w *Watcher) handleEvent(ctx context.Context, ev *tari_generated.Transactio
 	}
 	txn := ev.Transaction
 
-	if txn.Direction != "TRANSACTION_DIRECTION_INBOUND" {
+	// strings.EqualFold rather than == : minotari_console_wallet's gRPC server
+	// hardcodes a lowercase "inbound"/"outbound" literal for one specific edge case
+	// (a cancelled-while-still-pending transaction, handled via its
+	// TransactionWrapper::Inbound/Outbound branches in grpc/mod.rs) instead of the
+	// Display-derived "Inbound"/"Outbound" used everywhere else — EqualFold treats
+	// both consistently without needing a second constant for that corner case. See
+	// transactionEventDirectionInbound's doc comment for the full, live-confirmed
+	// explanation of why this does NOT compare against
+	// "TRANSACTION_DIRECTION_INBOUND".
+	if !strings.EqualFold(txn.Direction, transactionEventDirectionInbound) {
 		// Outbound events are this wallet's own sends, not incoming payments —
 		// not an error, just not relevant to invoice tracking.
 		log.Printf("eventwatcher: skipping non-inbound event (direction=%s, tx_id=%s)", txn.Direction, txn.TxId)

@@ -92,13 +92,23 @@ func fakeEventSource(evs []*tari_generated.TransactionEventResponse) EventSource
 	}
 }
 
+// inboundEvent/outboundEvent's Direction fixtures use "Inbound"/"Outbound" — the
+// SHORT form tari_generated.TransactionEvent.Direction actually uses on the wire
+// (confirmed live against a real minotari_console_wallet on 2026-09-13; see
+// transactionEventDirectionInbound's doc comment in watcher.go). Earlier revisions
+// of these fixtures used the long enum-name form
+// ("TRANSACTION_DIRECTION_INBOUND"/"_OUTBOUND"), which is what
+// tari_generated.TransactionInfo.Direction (a different struct, from
+// GetCompletedTransactions) uses — that mismatch let watcher.go's Direction check
+// ship broken against real traffic while these mock-fixture-based tests kept passing
+// against the same wrong assumption. Don't revert this back to the long form.
 func inboundEvent(paymentID, status, txID string) *tari_generated.TransactionEventResponse {
 	return &tari_generated.TransactionEventResponse{
 		Transaction: &tari_generated.TransactionEvent{
 			Event:         "Received",
 			TxId:          txID,
 			Status:        status,
-			Direction:     "TRANSACTION_DIRECTION_INBOUND",
+			Direction:     "Inbound",
 			Amount:        1000,
 			UserPaymentId: []byte(paymentID),
 		},
@@ -111,7 +121,7 @@ func outboundEvent(paymentID, status, txID string) *tari_generated.TransactionEv
 			Event:         "Sent",
 			TxId:          txID,
 			Status:        status,
-			Direction:     "TRANSACTION_DIRECTION_OUTBOUND",
+			Direction:     "Outbound",
 			Amount:        1000,
 			UserPaymentId: []byte(paymentID),
 		},
@@ -139,13 +149,19 @@ func TestRun_FullSequence(t *testing.T) {
 		t.Fatalf("create invA (untouched control): %v", err)
 	}
 
+	// Status fixtures use "Broadcast"/"Mined Confirmed"/"Rejected" — the short,
+	// space-separated form tari_generated.TransactionEvent.Status actually uses on
+	// the wire (confirmed live on 2026-09-13; see mapStatus's doc comment in
+	// watcher.go). The long TRANSACTION_STATUS_* enum-name form is what
+	// tari_generated.TransactionInfo.Status (from GetCompletedTransactions) uses,
+	// not this field.
 	events := []*tari_generated.TransactionEventResponse{
-		inboundEvent("unrelated-payment-id-does-not-exist", "TRANSACTION_STATUS_BROADCAST", "tx-unrelated"),
-		outboundEvent(invB.PaymentID, "TRANSACTION_STATUS_MINED_CONFIRMED", "tx-outbound-ignored"),
-		inboundEvent(invB.PaymentID, "TRANSACTION_STATUS_BROADCAST", "tx-b-1"),              // first-time seen
-		inboundEvent(invB.PaymentID, "TRANSACTION_STATUS_MINED_CONFIRMED", "tx-b-2"),        // first-time confirmed
-		inboundEvent(invB.PaymentID, "TRANSACTION_STATUS_MINED_CONFIRMED", "tx-b-2-repeat"), // repeat confirmed - must NOT refire
-		inboundEvent(invC.PaymentID, "TRANSACTION_STATUS_REJECTED", "tx-c-1"),               // rejected
+		inboundEvent("unrelated-payment-id-does-not-exist", "Broadcast", "tx-unrelated"),
+		outboundEvent(invB.PaymentID, "Mined Confirmed", "tx-outbound-ignored"),
+		inboundEvent(invB.PaymentID, "Broadcast", "tx-b-1"),              // first-time seen
+		inboundEvent(invB.PaymentID, "Mined Confirmed", "tx-b-2"),        // first-time confirmed
+		inboundEvent(invB.PaymentID, "Mined Confirmed", "tx-b-2-repeat"), // repeat confirmed - must NOT refire
+		inboundEvent(invC.PaymentID, "Rejected", "tx-c-1"),               // rejected
 	}
 
 	spy := &spySender{}
@@ -212,7 +228,7 @@ func TestRun_NoCallbackURLSkipsWebhookButStillUpdatesStatus(t *testing.T) {
 	}
 
 	events := []*tari_generated.TransactionEventResponse{
-		inboundEvent(inv.PaymentID, "TRANSACTION_STATUS_MINED_CONFIRMED", "tx-1"),
+		inboundEvent(inv.PaymentID, "Mined Confirmed", "tx-1"),
 	}
 	spy := &spySender{}
 	w := NewWatcher(invoiceStore, webhookStore, spy, "", fakeEventSource(events))
