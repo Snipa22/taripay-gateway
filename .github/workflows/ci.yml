@@ -5,6 +5,15 @@ on:
   push:
     branches: [main]
 
+# Least-privilege default (I9/I10 security-boundaries finding): absent an explicit
+# permissions: block, GITHUB_TOKEN inherits whatever the repo-level default is
+# (which may be broader, e.g. read/write) rather than this workflow requesting only
+# what it actually needs. The test job below only checks out code and runs the
+# build/test suite — it never pushes, comments, or otherwise writes back to the
+# repo/GitHub API — so contents: read is the correct (and only) permission needed.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -35,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
         with:
           go-version-file: go.mod
 
@@ -58,7 +67,7 @@ jobs:
           fi
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6  # v9
         with:
           version: v2.13
 

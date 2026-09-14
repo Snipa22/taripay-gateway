@@ -6,6 +6,16 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Least-privilege default (I9/I10 security-boundaries finding): absent an explicit
+# permissions: block, GITHUB_TOKEN inherits whatever the repo-level default is
+# rather than this workflow requesting only what it needs. contents: read covers
+# the test job below (checkout + build/test only); the docker job overrides this
+# with its own job-level permissions block (job-level permissions replace, not add
+# to, the workflow-level default for that job only — see the `docker:` job below)
+# since it additionally needs to push to GHCR.
+permissions:
+  contents: read
+
 jobs:
   # Same build/vet/fmt/test/golangci-lint gate as ci.yml, duplicated here (rather
   # than a reusable/shared workflow, matching go-crypto-pool's docker-build.yml
@@ -34,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
         with:
           go-version-file: go.mod
 
@@ -57,7 +67,7 @@ jobs:
           fi
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6  # v9
         with:
           version: v2.13
 
@@ -79,6 +89,17 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
 
+    # Job-level permissions override (I9/I10 security-boundaries finding): this is
+    # the only job in either workflow that logs into GHCR and pushes an image, so
+    # it's the only one that needs packages: write. Job-level permissions: blocks
+    # REPLACE (not add to) the workflow-level default above for that job only —
+    # standard GitHub Actions behavior — so contents: read must be restated here
+    # even though it's already the workflow-level default, or this job would only
+    # have packages: write and lose the (also-needed) checkout read access.
+    permissions:
+      contents: read
+      packages: write
+
     # Single-entry matrix: this repo has exactly one binary (cmd/gateway), unlike
     # go-crypto-pool's four. Kept as a matrix (rather than flattened into plain
     # steps) so a second binary can be added later without restructuring the job.
@@ -97,14 +118,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -112,7 +133,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
           images: ${{ matrix.image }}
           tags: |
@@ -123,7 +144,7 @@ jobs:
       # Push only happens on a version-tag push (never on a plain main push, and
       # never on a PR) — this mirrors go-crypto-pool's docker-build.yml gating.
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
