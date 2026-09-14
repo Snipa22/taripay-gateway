@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"log"
 	"math"
@@ -676,7 +677,7 @@ func setupAdminServer(t *testing.T) *admin.Server {
 		return &tari_generated.GetBalanceResponse{AvailableBalance: 0}, nil
 	}
 
-	adminServer, err := admin.New(invoiceStore, webhookStore, fakeSender, identify, getBalances)
+	adminServer, err := admin.New(invoiceStore, webhookStore, fakeSender, identify, getBalances, "https://merchant.example/webhook")
 	if err != nil {
 		t.Fatalf("admin.New() error = %v", err)
 	}
@@ -909,5 +910,100 @@ func TestCheckWebhookConfig_OnlyCallbackURLUnsetIsNotFatal(t *testing.T) {
 func TestCheckWebhookConfig_BothSetIsNotFatal(t *testing.T) {
 	if err := checkWebhookConfig("https://merchant.example/webhook", "some-secret"); err != nil {
 		t.Errorf("checkWebhookConfig(both set) error = %v, want nil", err)
+	}
+}
+
+// ---- parseFlags tests (I3 security-boundaries fix, task brief part 3: no CLI flag
+// for postgres DSN or the webhook HMAC secret) ----
+
+// newTestFlagSet builds a *flag.FlagSet with flag.ContinueOnError (rather than the
+// package-level flag.CommandLine's flag.ExitOnError, which would os.Exit the test
+// binary on a parse error) so parseFlags' returned error can be asserted on
+// directly.
+func newTestFlagSet() *flag.FlagSet {
+	return flag.NewFlagSet("test", flag.ContinueOnError)
+}
+
+// TestParseFlags_PostgresDSNIsNotARegisteredFlag confirms -postgres-dsn is rejected
+// as an unknown flag — the core of the I3 fix: this value must not be settable via
+// the command line at all (a CLI flag's value is visible in /proc/<pid>/cmdline,
+// `ps`, and shell history).
+func TestParseFlags_PostgresDSNIsNotARegisteredFlag(t *testing.T) {
+	_, _, err := parseFlags(newTestFlagSet(), []string{"-postgres-dsn=postgres://user:pass@host/db"})
+	if err == nil {
+		t.Fatal("parseFlags() error = nil, want an error: -postgres-dsn must not be a registered CLI flag")
+	}
+	if !strings.Contains(err.Error(), "postgres-dsn") {
+		t.Errorf("parseFlags() error = %v, want it to reference the unrecognized flag name", err)
+	}
+}
+
+// TestParseFlags_WebhookHMACSecretIsNotARegisteredFlag is
+// TestParseFlags_PostgresDSNIsNotARegisteredFlag's sibling for the other secret
+// value this fix covers.
+func TestParseFlags_WebhookHMACSecretIsNotARegisteredFlag(t *testing.T) {
+	_, _, err := parseFlags(newTestFlagSet(), []string{"-webhook-hmac-secret=super-secret-value"})
+	if err == nil {
+		t.Fatal("parseFlags() error = nil, want an error: -webhook-hmac-secret must not be a registered CLI flag")
+	}
+	if !strings.Contains(err.Error(), "webhook-hmac-secret") {
+		t.Errorf("parseFlags() error = %v, want it to reference the unrecognized flag name", err)
+	}
+}
+
+// TestParseFlags_RemainingFlagsStillWork is a regression guard confirming this
+// fix's flag.FlagSet extraction didn't drop or break any of the CLI flags that ARE
+// still meant to be settable on the command line (task brief's explicit exception:
+// -admin-auth-token stays a CLI flag, and every other pre-existing non-secret flag
+// is unaffected by this fix).
+func TestParseFlags_RemainingFlagsStillWork(t *testing.T) {
+	flags, printVersion, err := parseFlags(newTestFlagSet(), []string{
+		"-config=/etc/taripay/config.toml",
+		"-wallet-grpc-addr=127.0.0.1:9999",
+		"-http-addr=:9090",
+		"-webhook-callback-url=https://merchant.example/webhook",
+		"-admin-auth-token=some-admin-token",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if printVersion {
+		t.Error("printVersion = true, want false (-version was not passed)")
+	}
+	if flags.ConfigFile != "/etc/taripay/config.toml" {
+		t.Errorf("ConfigFile = %q, want the -config flag value", flags.ConfigFile)
+	}
+	if flags.WalletGRPCAddress != "127.0.0.1:9999" {
+		t.Errorf("WalletGRPCAddress = %q, want the -wallet-grpc-addr flag value", flags.WalletGRPCAddress)
+	}
+	if flags.HTTPListenAddr != ":9090" {
+		t.Errorf("HTTPListenAddr = %q, want the -http-addr flag value", flags.HTTPListenAddr)
+	}
+	if flags.WebhookCallbackURL != "https://merchant.example/webhook" {
+		t.Errorf("WebhookCallbackURL = %q, want the -webhook-callback-url flag value", flags.WebhookCallbackURL)
+	}
+	if flags.AdminAuthToken != "some-admin-token" {
+		t.Errorf("AdminAuthToken = %q, want the -admin-auth-token flag value", flags.AdminAuthToken)
+	}
+	// PostgresDSN/WebhookHMACSecret must remain unset by parseFlags itself (no
+	// flag populates them) — config.Load is still responsible for resolving
+	// them from env var/config file, which parseFlags has no part in.
+	if flags.PostgresDSN != "" {
+		t.Errorf("PostgresDSN = %q, want empty (parseFlags never populates this field)", flags.PostgresDSN)
+	}
+	if flags.WebhookHMACSecret != "" {
+		t.Errorf("WebhookHMACSecret = %q, want empty (parseFlags never populates this field)", flags.WebhookHMACSecret)
+	}
+}
+
+// TestParseFlags_VersionFlag confirms -version is still parsed correctly through
+// this fix's extraction.
+func TestParseFlags_VersionFlag(t *testing.T) {
+	_, printVersion, err := parseFlags(newTestFlagSet(), []string{"-version"})
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if !printVersion {
+		t.Error("printVersion = false, want true (-version was passed)")
 	}
 }

@@ -93,18 +93,63 @@ const (
 	httpServerIdleTimeout       = 60 * time.Second
 )
 
-func main() {
-	configFile := flag.String("config", "", "Path to a TOML config file (env: TARIPAY_CONFIG_FILE)")
-	walletGRPCAddr := flag.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
-	postgresDSN := flag.String("postgres-dsn", "", "Postgres connection string (env: TARIPAY_POSTGRES_DSN; required, no default)")
-	httpAddr := flag.String("http-addr", "", "HTTP listen address (env: TARIPAY_HTTP_LISTEN_ADDR; default: "+config.DefaultHTTPListenAddr+")")
-	webhookCallbackURL := flag.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
-	webhookHMACSecret := flag.String("webhook-hmac-secret", "", "Webhook HMAC signing secret (env: TARIPAY_WEBHOOK_HMAC_SECRET; no default; required if webhook-callback-url is set — startup fails otherwise)")
-	adminAuthToken := flag.String("admin-auth-token", "", "Shared bearer token required on all /admin* routes (env: TARIPAY_ADMIN_AUTH_TOKEN; no default, admin routes are NOT registered at all if unset)")
-	printVersion := flag.Bool("version", false, "Print the gateway version and exit")
-	flag.Parse()
+// parseFlags registers this binary's CLI flags on fs and parses args against them,
+// returning the resulting config.Flags (ready to pass straight into config.Load) and
+// whether -version was passed. Extracted out of main() specifically so
+// main_test.go's TestParseFlags_* tests can exercise flag registration/parsing
+// directly (e.g. confirming -postgres-dsn/-webhook-hmac-secret are rejected as
+// unknown flags — see this function's PostgresDSN/WebhookHMACSecret comment below)
+// without needing a subprocess harness around the real os.Args/flag.CommandLine.
+//
+// -postgres-dsn and -webhook-hmac-secret are deliberately NOT registered here (I3
+// security-boundaries fix, task brief part 3): a CLI flag's value lands in
+// /proc/<pid>/cmdline, `ps`, and shell history, which is a real exposure for these
+// two genuinely secret values. Both remain settable via env var
+// (TARIPAY_POSTGRES_DSN / TARIPAY_WEBHOOK_HMAC_SECRET) or the TOML config file, per
+// config.Load's existing flag > env > file > default precedence — only the flag
+// layer is removed for these two fields specifically; config.Flags.PostgresDSN/
+// config.Flags.WebhookHMACSecret themselves are untouched (see that struct's doc
+// comment), so the returned config.Flags below simply never populates them (left at
+// their zero value ""), letting config.Load fall through to env/file for both.
+// -admin-auth-token is NOT included in this fix (out of scope per the task brief:
+// it's fine to keep on the command line).
+func parseFlags(fs *flag.FlagSet, args []string) (flags config.Flags, printVersion bool, err error) {
+	configFile := fs.String("config", "", "Path to a TOML config file (env: TARIPAY_CONFIG_FILE)")
+	walletGRPCAddr := fs.String("wallet-grpc-addr", "", "minotari_console_wallet gRPC address (env: TARIPAY_WALLET_GRPC_ADDR; default: "+config.DefaultWalletGRPCAddress+")")
+	httpAddr := fs.String("http-addr", "", "HTTP listen address (env: TARIPAY_HTTP_LISTEN_ADDR; default: "+config.DefaultHTTPListenAddr+")")
+	webhookCallbackURL := fs.String("webhook-callback-url", "", "Merchant webhook callback URL (env: TARIPAY_WEBHOOK_CALLBACK_URL; no default, webhook delivery disabled if unset)")
+	adminAuthToken := fs.String("admin-auth-token", "", "Shared bearer token required on all /admin* routes (env: TARIPAY_ADMIN_AUTH_TOKEN; no default, admin routes are NOT registered at all if unset)")
+	pv := fs.Bool("version", false, "Print the gateway version and exit")
 
-	if *printVersion {
+	if err := fs.Parse(args); err != nil {
+		return config.Flags{}, false, err
+	}
+
+	return config.Flags{
+		ConfigFile:         *configFile,
+		WalletGRPCAddress:  *walletGRPCAddr,
+		HTTPListenAddr:     *httpAddr,
+		WebhookCallbackURL: *webhookCallbackURL,
+		AdminAuthToken:     *adminAuthToken,
+		// PostgresDSN/WebhookHMACSecret: intentionally left unset (see this
+		// function's doc comment above) — config.Load still resolves both
+		// from env var/config file.
+	}, *pv, nil
+}
+
+func main() {
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flags, printVersion, err := parseFlags(fs, os.Args[1:])
+	if err != nil {
+		// flag.ExitOnError above already calls os.Exit(2) on a parse error
+		// (unknown flag, -h/-help, etc.) before returning here — this is
+		// only reachable if that error-handling policy is ever changed to
+		// something that returns instead of exiting, so it's a defensive
+		// fallback, not the primary path.
+		log.Fatalf("gateway: %v", err)
+	}
+
+	if printVersion {
 		fmt.Println(version)
 		return
 	}
@@ -112,15 +157,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	cfg, err := config.Load(config.Flags{
-		ConfigFile:         *configFile,
-		WalletGRPCAddress:  *walletGRPCAddr,
-		PostgresDSN:        *postgresDSN,
-		HTTPListenAddr:     *httpAddr,
-		WebhookCallbackURL: *webhookCallbackURL,
-		WebhookHMACSecret:  *webhookHMACSecret,
-		AdminAuthToken:     *adminAuthToken,
-	})
+	cfg, err := config.Load(flags)
 	if err != nil {
 		log.Fatalf("gateway: %v", err)
 	}
