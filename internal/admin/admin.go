@@ -62,6 +62,16 @@ type Server struct {
 	identify     IdentifyFunc
 	getBalances  GetBalancesFunc
 
+	// callbackURL is the CURRENTLY configured webhook callback URL (cfg.WebhookCallbackURL
+	// at the time this Server was constructed — see cmd/gateway/main.go's admin.New
+	// call site). The I2 security-boundaries fix (task brief part 2): handleWebhookRetry
+	// below sends every manual retry to THIS url, not the one frozen in the delivery
+	// row's own CallbackURL column at the time it was first created. If an operator
+	// rotates TARIPAY_WEBHOOK_CALLBACK_URL (domain decommissioned, staging URL
+	// misconfigured, etc.), a retry on an old row must follow the rotation, not
+	// silently re-deliver signed payment data to a stale destination.
+	callbackURL string
+
 	dashboardTmpl  *template.Template
 	invoicesTmpl   *template.Template
 	deliveriesTmpl *template.Template
@@ -70,7 +80,11 @@ type Server struct {
 // New parses the embedded templates and constructs a Server. Returns an error if the
 // templates fail to parse (a build-time programming error, not a runtime/request
 // error).
-func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc) (*Server, error) {
+//
+// callbackURL is the currently-configured webhook callback URL (cfg.WebhookCallbackURL)
+// — see Server.callbackURL's doc comment for why the retry route needs it threaded in
+// here rather than reading it off the delivery row being retried.
+func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, callbackURL string) (*Server, error) {
 	dashboardTmpl, err := template.New("layout.html").ParseFS(templateFS, "templates/layout.html", "templates/dashboard.html", "templates/deliveries_panel.html")
 	if err != nil {
 		return nil, fmt.Errorf("admin: parse dashboard templates: %w", err)
@@ -90,6 +104,7 @@ func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhoo
 		sender:         sender,
 		identify:       identify,
 		getBalances:    getBalances,
+		callbackURL:    callbackURL,
 		dashboardTmpl:  dashboardTmpl,
 		invoicesTmpl:   invoicesTmpl,
 		deliveriesTmpl: deliveriesTmpl,
@@ -388,6 +403,19 @@ func (s *Server) handleWebhookRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// I2 security-boundaries fix (task brief part 2): only pending/failed rows
+	// are retryable. A delivery already marked delivered has already
+	// succeeded — re-sending it is never the right response to a POST on this
+	// route, and doing so silently (with no status check at all, as this
+	// route used to) is exactly the finding this closes. 409 Conflict (not a
+	// silent no-op retry) so the operator/HTMX caller gets an explicit signal
+	// that this row is not in a retryable state, without ever reaching
+	// s.sender.
+	if delivery.Status != webhook.StatusFailed && delivery.Status != webhook.StatusPending {
+		http.Error(w, fmt.Sprintf("webhook delivery %s is not retryable (status: %s)", delivery.ID, delivery.Status), http.StatusConflict)
+		return
+	}
+
 	flash, flashIsError := s.retryAndDescribe(r.Context(), delivery)
 
 	deliveries, err := s.webhookStore.ListRecent(r.Context(), DashboardDeliveryLimit)
@@ -406,8 +434,19 @@ func (s *Server) handleWebhookRetry(w http.ResponseWriter, r *http.Request) {
 // retryAndDescribe performs one retry attempt via webhook.Attempt and returns a
 // human-readable flash message describing the outcome (and whether it should render
 // as an error banner).
+//
+// I2 security-boundaries fix (task brief part 2): the delivery passed to
+// webhook.Attempt is a shallow copy of delivery with CallbackURL overridden to
+// s.callbackURL (the CURRENTLY configured webhook callback URL — see Server.callbackURL's
+// doc comment), not the URL frozen in the row at creation time. webhook.Attempt never
+// persists CallbackURL back to the store (see that function's own Store.MarkDelivered/
+// MarkFailed calls, neither of which touches that column), so this override only
+// affects where THIS attempt's HTTP POST goes, not the delivery row's stored history.
 func (s *Server) retryAndDescribe(ctx context.Context, delivery *webhook.Delivery) (flash string, flashIsError bool) {
-	if err := webhook.Attempt(ctx, s.webhookStore, s.sender, delivery); err != nil {
+	retryTarget := *delivery
+	retryTarget.CallbackURL = s.callbackURL
+
+	if err := webhook.Attempt(ctx, s.webhookStore, s.sender, &retryTarget); err != nil {
 		log.Printf("admin: retry: attempt bookkeeping for delivery %s: %v", delivery.ID, err)
 		return fmt.Sprintf("Retry attempted for delivery %s, but recording the result failed: %v", delivery.ID, err), true
 	}
