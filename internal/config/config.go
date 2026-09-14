@@ -94,6 +94,20 @@ type Config struct {
 // flag (zero value 0) can be distinguished from an explicit "0" override — a plain int
 // would make "flag not passed" indistinguishable from "flag explicitly set to 0" and
 // therefore always win over env/file/default.
+//
+// PostgresDSN/WebhookHMACSecret (the I3 security-boundaries fix, task brief part 3):
+// these two fields remain here — this package still resolves them at flag > env >
+// file > default precedence like every other field, and any caller (including this
+// package's own tests) can still set them programmatically — but cmd/gateway/main.go
+// deliberately no longer registers an actual `-postgres-dsn`/`-webhook-hmac-secret`
+// CLI flag.String(...) to populate them from: a CLI flag's value is visible in
+// /proc/<pid>/cmdline, `ps`, and shell history, which is a real exposure for two
+// genuinely secret values, when the env var and config-file paths already cover the
+// same need with none of that exposure. Left as plain (non-pointer) strings — unlike
+// ConfirmationDepth/InvoiceTTLMinutes above — since "" is already exactly the right
+// "not set" sentinel for both (see Config's own doc comment: neither has a hard
+// Load()-time-required default, so there's no ambiguity a pointer would need to
+// resolve).
 type Flags struct {
 	ConfigFile         string
 	WalletGRPCAddress  string
