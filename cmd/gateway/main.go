@@ -199,7 +199,7 @@ func main() {
 	// UI's manual retry button.
 	go runWebhookRetryLoop(ctx, webhookStore, sender, webhookRetryTickerInterval)
 
-	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances)
+	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances, cfg.WebhookCallbackURL)
 	if err != nil {
 		log.Fatalf("gateway: admin: %v", err)
 	}

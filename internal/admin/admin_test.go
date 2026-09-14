@@ -22,11 +22,24 @@ import (
 	"github.com/Snipa22/taripay-gateway/internal/webhook"
 )
 
+// testDeliveryCallbackURL is the callback URL every test fixture in this file
+// stores on a webhook_deliveries row it creates (via webhookStore.Create). It's
+// deliberately the SAME value setupServer wires in as the "currently configured"
+// callback URL for most tests (see setupServer's currentCallbackURL param), so
+// every pre-existing retry test keeps asserting against an unchanged URL —
+// TestHandleWebhookRetry_UsesCurrentlyConfiguredCallbackURL below is the one test
+// that deliberately configures a DIFFERENT current URL to exercise the I2 fix.
+const testDeliveryCallbackURL = "https://merchant.example/webhook"
+
 // setupServer connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema, and
 // returns a fully-wired *Server plus its underlying invoice/webhook stores for test
 // fixtures. Skips the calling test if no live Postgres DSN is configured — same
 // convention as every other package's setup helper in this repo.
-func setupServer(t *testing.T, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc) (*Server, *invoice.Store, *webhook.Store) {
+//
+// currentCallbackURL is threaded straight into New's callbackURL parameter (the I2
+// fix, task brief part 2: the retry route must send to the CURRENTLY configured
+// callback URL, not the one frozen on the delivery row at creation time).
+func setupServer(t *testing.T, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, currentCallbackURL string) (*Server, *invoice.Store, *webhook.Store) {
 	t.Helper()
 	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -66,7 +79,7 @@ func setupServer(t *testing.T, sender webhook.SenderInterface, identify Identify
 		}
 	}
 
-	srv, err := New(invoiceStore, webhookStore, sender, identify, getBalances)
+	srv, err := New(invoiceStore, webhookStore, sender, identify, getBalances, currentCallbackURL)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -79,10 +92,18 @@ type fakeSender struct {
 	statusCode int
 	err        error
 	calls      int
+
+	// lastCallbackURL records the callbackURL argument Send was most recently
+	// invoked with — used by TestHandleWebhookRetry_UsesCurrentlyConfiguredCallbackURL
+	// below (the I2 fix, task brief part 2) to assert the retry route actually
+	// sent to the currently-configured URL, not the one stored on the delivery
+	// row.
+	lastCallbackURL string
 }
 
 func (f *fakeSender) Send(ctx context.Context, callbackURL string, payload []byte) (int, error) {
 	f.calls++
+	f.lastCallbackURL = callbackURL
 	return f.statusCode, f.err
 }
 
@@ -103,7 +124,7 @@ func authedRequest(method, target string, body io.Reader) *http.Request {
 
 func TestHandleDashboard_RendersExpectedContent(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	ctx := context.Background()
 	inv, err := invoiceStore.Create(ctx, "order-dash", 5000, time.Hour)
@@ -138,7 +159,7 @@ func TestHandleDashboard_WalletErrorDegradesGracefully(t *testing.T) {
 	identify := func() (*tari_generated.GetIdentityResponse, error) {
 		return nil, errors.New("wallet: connection refused")
 	}
-	srv, _, _ := setupServer(t, sender, identify, nil)
+	srv, _, _ := setupServer(t, sender, identify, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, testAdminAuthToken)
@@ -184,7 +205,7 @@ func TestHandleDashboard_WalletErrorDoesNotLeakDetail(t *testing.T) {
 	identify := func() (*tari_generated.GetIdentityResponse, error) {
 		return nil, errors.New(sensitiveDetail)
 	}
-	srv, _, _ := setupServer(t, sender, identify, nil)
+	srv, _, _ := setupServer(t, sender, identify, nil, testDeliveryCallbackURL)
 	logBuf := captureLog(t)
 
 	mux := http.NewServeMux()
@@ -231,7 +252,7 @@ func TestHandleDashboard_WalletErrorDoesNotLeakDetail(t *testing.T) {
 
 func TestHandleInvoices_FiltersByStatus(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, invoiceStore, _ := setupServer(t, sender, nil, nil)
+	srv, invoiceStore, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 	ctx := context.Background()
 
 	pending, err := invoiceStore.Create(ctx, "order-pending", 100, time.Hour)
@@ -269,7 +290,7 @@ func TestHandleInvoices_FiltersByStatus(t *testing.T) {
 
 func TestHandleWebhookRetry_CallsSenderAndUpdatesRecord(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 	ctx := context.Background()
 
 	inv, err := invoiceStore.Create(ctx, "order-retry", 100, time.Hour)
@@ -315,6 +336,115 @@ func TestHandleWebhookRetry_CallsSenderAndUpdatesRecord(t *testing.T) {
 	}
 }
 
+// TestHandleWebhookRetry_UsesCurrentlyConfiguredCallbackURL is the I2
+// security-boundaries regression test (task brief part 2): a delivery row's stored
+// CallbackURL is deliberately set to one value at creation time, then the Server
+// under test is configured (via setupServer's currentCallbackURL param, i.e. New's
+// callbackURL argument) with a DIFFERENT "currently configured" URL. The retry route
+// must send to the CURRENT url, not the one frozen on the row — asserted directly on
+// what URL the spy sender actually received, not merely that the row's stored
+// CallbackURL column is unchanged (it must remain unchanged too: this fix only
+// changes where THIS attempt's HTTP POST goes, never what's persisted).
+func TestHandleWebhookRetry_UsesCurrentlyConfiguredCallbackURL(t *testing.T) {
+	const (
+		staleStoredURL       = "https://old-staging.example/webhook"
+		currentConfiguredURL = "https://current.example/webhook"
+	)
+
+	sender := &fakeSender{statusCode: 200}
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, currentConfiguredURL)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-stale-url", 100, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	// Delivery row is created with the STALE URL, as if it had been created back
+	// when that was the configured callback URL.
+	delivery, err := webhookStore.Create(ctx, inv.ID, staleStoredURL, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+	if err := webhookStore.MarkFailed(ctx, delivery.ID, nil, "initial failure"); err != nil {
+		t.Fatalf("seed failed delivery: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/webhooks/"+delivery.ID.String()+"/retry", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if sender.calls != 1 {
+		t.Fatalf("sender.calls = %d, want 1", sender.calls)
+	}
+	if sender.lastCallbackURL != currentConfiguredURL {
+		t.Errorf("sender received callbackURL = %q, want the CURRENTLY configured URL %q (not the stale stored URL %q)", sender.lastCallbackURL, currentConfiguredURL, staleStoredURL)
+	}
+
+	// The stored row's own CallbackURL column must remain exactly what it was
+	// created with — this fix only changes where the retry attempt's HTTP POST
+	// goes, never what's persisted on the delivery row.
+	got, err := webhookStore.GetByID(ctx, delivery.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.CallbackURL != staleStoredURL {
+		t.Errorf("stored CallbackURL = %q, want unchanged %q", got.CallbackURL, staleStoredURL)
+	}
+}
+
+// TestHandleWebhookRetry_AlreadyDeliveredReturns409 is the I2 security-boundaries
+// regression test's other half (task brief part 2): a retry on a row whose status is
+// already `delivered` must be rejected with 409 Conflict and must NOT reach the
+// sender at all (i.e. the status check happens before any side effect).
+func TestHandleWebhookRetry_AlreadyDeliveredReturns409(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
+	ctx := context.Background()
+
+	inv, err := invoiceStore.Create(ctx, "order-already-delivered", 100, time.Hour)
+	if err != nil {
+		t.Fatalf("create invoice: %v", err)
+	}
+	delivery, err := webhookStore.Create(ctx, inv.ID, testDeliveryCallbackURL, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+	if err := webhookStore.MarkDelivered(ctx, delivery.ID, 200); err != nil {
+		t.Fatalf("seed delivered delivery: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/webhooks/"+delivery.ID.String()+"/retry", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender.calls = %d, want 0 (retry on an already-delivered row must not call the sender)", sender.calls)
+	}
+
+	got, err := webhookStore.GetByID(ctx, delivery.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Attempts != 0 {
+		t.Errorf("Attempts = %d, want 0 (rejected retry must not increment attempts)", got.Attempts)
+	}
+	if got.Status != webhook.StatusDelivered {
+		t.Errorf("Status = %q, want unchanged %q", got.Status, webhook.StatusDelivered)
+	}
+}
+
 // ---- static asset tests (task brief part 5, I11/I15: self-host HTMX) ----
 
 // TestHandleHTMXStatic_ReturnsEmbeddedFile confirms GET /admin/static/htmx.min.js
@@ -323,7 +453,7 @@ func TestHandleWebhookRetry_CallsSenderAndUpdatesRecord(t *testing.T) {
 // succeeds with NO Authorization header at all, unlike every other /admin* route.
 func TestHandleHTMXStatic_ReturnsEmbeddedFile(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, _, _ := setupServer(t, sender, nil, nil)
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, testAdminAuthToken)
@@ -357,7 +487,7 @@ func TestHandleHTMXStatic_ReturnsEmbeddedFile(t *testing.T) {
 
 func TestHandleWebhookRetry_UnknownIDReturns404(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, _, _ := setupServer(t, sender, nil, nil)
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, testAdminAuthToken)
@@ -397,7 +527,7 @@ func adminRouteTestCases() []struct {
 // Authorization header at all.
 func TestRequireAuth_MissingHeaderReturns401(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, _, _ := setupServer(t, sender, nil, nil)
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, testAdminAuthToken)
@@ -422,7 +552,7 @@ func TestRequireAuth_MissingHeaderReturns401(t *testing.T) {
 // well-formed but incorrect bearer token.
 func TestRequireAuth_WrongTokenReturns401(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, _, _ := setupServer(t, sender, nil, nil)
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, testAdminAuthToken)
@@ -450,7 +580,7 @@ func TestRequireAuth_WrongTokenReturns401(t *testing.T) {
 // actually invoked, not just that some 2xx/404 status was returned.
 func TestRequireAuth_CorrectTokenReachesHandler(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 	ctx := context.Background()
 
 	inv, err := invoiceStore.Create(ctx, "order-auth-retry", 100, time.Hour)
@@ -502,7 +632,7 @@ func TestRequireAuth_CorrectTokenReachesHandler(t *testing.T) {
 // is written).
 func TestRequireAuth_RetryRouteSpecificallyRequiresAuth(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil)
+	srv, invoiceStore, webhookStore := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 	ctx := context.Background()
 
 	inv, err := invoiceStore.Create(ctx, "order-retry-noauth", 100, time.Hour)
@@ -549,7 +679,7 @@ func TestRequireAuth_RetryRouteSpecificallyRequiresAuth(t *testing.T) {
 // middleware itself doesn't silently open up if that invariant is ever violated.
 func TestRequireAuth_EmptyTokenAlwaysRejects(t *testing.T) {
 	sender := &fakeSender{statusCode: 200}
-	srv, _, _ := setupServer(t, sender, nil, nil)
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux, "")
